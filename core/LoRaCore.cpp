@@ -2,6 +2,7 @@
 
 // Static member definitions
 TaskHandle_t LoRaCore::receiverTaskHandle = nullptr;
+TaskHandle_t LoRaCore::senderTaskHandle = nullptr;
 
 // Helper logging functions (global, not class methods)
 void LLog(const char *s)
@@ -85,7 +86,7 @@ bool LoRaCore::begin()
 
     // Create tasks
     BaseType_t res1 = xTaskCreatePinnedToCore(receiveTaskWrapper, "LoRaRecv", 6144, this, 3, &receiverTaskHandle, 1);
-    BaseType_t res2 = xTaskCreatePinnedToCore(sendTaskWrapper, "LoRaSend", 6144, this, 2, nullptr, 1);
+    BaseType_t res2 = xTaskCreatePinnedToCore(sendTaskWrapper, "LoRaSend", 6144, this, 2, &senderTaskHandle, 1);
     BaseType_t res3 = xTaskCreatePinnedToCore(resendTaskWrapper, "LoRaRetry", 4096, this, 1, nullptr, 0);
     BaseType_t res4 = xTaskCreatePinnedToCore(logTaskWrapper, "LoRaLog", 3072, this, 1, nullptr, 0);
 
@@ -149,8 +150,17 @@ bool LoRaCore::removePendingPacket(PacketId_t packetId)
     return removed;
 }
 
+int LoRaCore::transmitPacket(const LoRaPacket *txPkt, const size_t len)
+{
+    xSemaphoreTake(radioSemaphore, portMAX_DELAY);
+    radio.standby();
+    int result = radio.transmit((uint8_t *)txPkt, len);
+    radio.startReceive();
+    xSemaphoreGive(radioSemaphore);
+    return result;
+}
 
-PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload, bool waitForAck, bool highPriority)
+PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload)
 {
     if (!outgoingQueue) {
         char s2[100];
@@ -167,11 +177,8 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
     // 2. Not ACK/BULK_ACK (they need immediate delivery)
     // 3. Queue has packets waiting
     // 4. Payload is small enough (leaving room for headers)
-    bool canAggregate = !highPriority && 
-                        base.packetType != CMD_ACK && 
-                        base.packetType != CMD_BULK_ACK &&
-                        base.packetType != CMD_REQUEST_ASA &&
-                        base.packetType != CMD_REPOSNCE_ASA &&
+    bool canAggregate = base.highPriority == false && 
+                        base.ackRequired == false &&
                         base.payloadLen <= 30 &&
                         uxQueueMessagesWaiting(outgoingQueue) > 0;
     
@@ -200,7 +207,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                                searchPkt.packetType != CMD_ACK && 
                                searchPkt.packetType != CMD_BULK_ACK &&
                                searchPkt.packetType != CMD_REQUEST_ASA &&
-                               searchPkt.packetType != CMD_REPOSNCE_ASA &&
+                               searchPkt.packetType != CMD_RESPONCE_ASA &&
                                searchPkt.payloadLen <= 30) {
                         // Found regular packet that can be aggregated
                         foundRegular = true;
@@ -232,7 +239,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                         removed = true;
                         break;
                     }
-                    xQueueSendToBack(outgoingQueue, &tempPkt, 0);
+                    xQueueSendToBack(outgoingQueue, &tempPkt, 10);
                 }
                 
                 if (removed) {
@@ -272,7 +279,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                             
                             LoRaPacket agrFrame = {};
                             packBaseIntoLoRa(agrFrame, srcAddress, receiverId, newAgr, agrPayload);
-                            xQueueSendToBack(outgoingQueue, &agrFrame, pdMS_TO_TICKS(200));
+                            xQueueSendToBack(outgoingQueue, &agrFrame, 20);
                             
                             char s[120];
                             snprintf(s, sizeof(s), "📦➕ Added to AGR: id=%u, type=%c, count=%u→%u, to=%u", 
@@ -295,7 +302,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                     removed = true;
                     break;
                 }
-                xQueueSendToBack(outgoingQueue, &tempPkt, 0);
+                xQueueSendToBack(outgoingQueue, &tempPkt, 10);
             }
             
             if (removed) {
@@ -322,7 +329,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                     putToLogBuffer(String(s));
                     
                     // Add to pending if waitForAck
-                    if (waitForAck && pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (base.ackRequired && pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         PendingSend pendingItem = {};
                         pendingItem.pkt = agrFrame;
                         pendingItem.timestamp = millis();
@@ -342,13 +349,13 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
     packBaseIntoLoRa(frame, srcAddress, receiverId, base, payload);
     
     bool ok;
-    if (highPriority) {
+    if (base.highPriority) {
         ok = xQueueSendToFront(outgoingQueue, &frame, pdMS_TO_TICKS(100)) == pdTRUE;
     } else {
         ok = xQueueSendToBack(outgoingQueue, &frame, pdMS_TO_TICKS(200)) == pdTRUE;
     }
     
-    if (ok && waitForAck) {
+    if (ok && base.ackRequired) {
         if (pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(2100)) == pdTRUE) {
             auto existingIt = std::find_if(pending.begin(), pending.end(),
                                           [&frame](const PendingSend &p)
@@ -374,31 +381,54 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
     return base.packetId;
 }
 
-void LoRaCore::packBaseIntoLoRa(LoRaPacket &out, LoraAddress_t senderId, LoraAddress_t receiverId, const PacketBase &base, const uint8_t *payload)
+void LoRaCore::packBaseIntoLoRa(LoRaPacket &out,
+                                LoraAddress_t senderId,
+                                LoraAddress_t receiverId,
+                                const PacketBase &base,
+                                const uint8_t *payload)
 {
     memset(&out, 0, sizeof(out));
     out.setSenderId(senderId);
     out.setReceiverId(receiverId);
     out.packetType = base.packetType;
-    out.packetId = base.packetId;
+    out.packetId   = base.packetId;
 
-    if (base.payloadLen == 0 || payload == nullptr)
-    {
+    // --- FLAGS MAPPING ---
+    out.setAckRequired(base.ackRequired);
+    out.setHighPriority(base.highPriority);
+    out.setService(base.service);
+    out.setNoRetry(base.noRetry);
+    out.setEncrypted(base.encrypted);
+    out.setCompressed(base.compressed);
+    out.setAggregatedFrame(base.aggregated);
+    out.setInternalLocalOnly(base.internalLocalOnly);
+
+    // --- PAYLOAD CHECKS ---
+    if (base.payloadLen > MAX_LORA_PAYLOAD) {
         out.payloadLen = 0;
+        char msg[100];
+        snprintf(msg, sizeof(msg),
+                 "❌ packBase: payloadLen %u exceeds MAX %u",
+                 base.payloadLen, MAX_LORA_PAYLOAD);
+        putToLogBuffer(msg);
         return;
     }
 
-    if (base.payloadLen > MAX_LORA_PAYLOAD)
-    {
+    if (base.payloadLen > 0 && payload == nullptr) {
         out.payloadLen = 0;
         char msg[100];
-        snprintf(msg, sizeof(msg), "❌ packBase: payloadLen %u exceeds MAX %u", base.payloadLen, MAX_LORA_PAYLOAD);
+        snprintf(msg, sizeof(msg),
+                 "❌ packBase: payload is null, len=%u",
+                 base.payloadLen);
         putToLogBuffer(msg);
         return;
     }
 
     out.payloadLen = base.payloadLen;
-    memcpy(out.payload, payload, base.payloadLen);
+
+    if (out.payloadLen > 0) {
+        memcpy(out.payload, payload, out.payloadLen);
+    }
 
     // String hex = "";
     // for (uint8_t i = 0; i < base.payloadLen && i < 32; ++i)
@@ -462,19 +492,15 @@ void LoRaCore::handleBulkAck(const LoRaPacket &pkt)
     PacketId_t uniqueIds[10];
     uint8_t uniqueCount = 0;
 
-    for (uint8_t i = 0; i < count; i++)
-    {
+    for (uint8_t i = 0; i < count; i++) {
         bool isDuplicate = false;
-        for (uint8_t j = 0; j < uniqueCount; j++)
-        {
-            if (uniqueIds[j] == ackedIds[i])
-            {
+        for (uint8_t j = 0; j < uniqueCount; j++) {
+            if (uniqueIds[j] == ackedIds[i]) {
                 isDuplicate = true;
                 break;
             }
         }
-        if (!isDuplicate && uniqueCount < 10)
-        {
+        if (!isDuplicate && uniqueCount < 10) {
             uniqueIds[uniqueCount] = ackedIds[i];
             uniqueCount++;
         }
@@ -482,32 +508,26 @@ void LoRaCore::handleBulkAck(const LoRaPacket &pkt)
 
     String idList = "";
     String uniqueIdList = "";
-    for (uint8_t i = 0; i < count; i++)
-    {
+    for (uint8_t i = 0; i < count; i++) {
         if (i > 0)
             idList += ",";
         idList += String(ackedIds[i]);
     }
-    for (uint8_t i = 0; i < uniqueCount; i++)
-    {
+    for (uint8_t i = 0; i < uniqueCount; i++) {
         if (i > 0)
             uniqueIdList += ",";
         uniqueIdList += String(uniqueIds[i]);
     }
 
-    char successLog[200];
-    if (uniqueCount != count)
-    {
+    char successLog[120];
+    if (uniqueCount != count) {
         snprintf(successLog, sizeof(successLog), "📩 BULK ACK: %u IDs [%s] → %u unique [%s] from device %u (filtered %u duplicates)", count, idList.c_str(), uniqueCount, uniqueIdList.c_str(), pkt.getSenderId(), count - uniqueCount);
-    }
-    else
-    {
+    } else {
         snprintf(successLog, sizeof(successLog), "📩 BULK ACK received: %u IDs [%s] from device %u", count, idList.c_str(), pkt.getSenderId());
     }
     putToLogBuffer(String(successLog));
 
-    for (uint8_t i = 0; i < uniqueCount; i++)
-    {
+    for (uint8_t i = 0; i < uniqueCount; i++) {
         handleSingleAck(uniqueIds[i], pkt.getSenderId(), pkt.packetType);
     }
 }
@@ -594,7 +614,7 @@ void LoRaCore::sendBulkAck(uint8_t targetDeviceId)
 
     size_t payloadSize = sizeof(uint8_t) + (pendingBulkAck.count * sizeof(PacketId_t));
 
-    sendPacketBase(targetDeviceId, pendingBulkAck, payload, false, true);
+    sendPacketBase(targetDeviceId, pendingBulkAck, payload);
 
     //putToLogBuffer(String("✅ Sent BULK ACK for ") + String(pendingBulkAck.count) + " packets: " + pendingBulkAck.getDebugInfo());
 
@@ -617,65 +637,66 @@ void LoRaCore::checkBulkAckTimeout(uint8_t targetDeviceId)
 
 void LoRaCore::updateRetryParameters()
 {
-    if (_mode == RadioMode::LORA)
-    {
+    
+    char s[220];
+    if (_mode == RadioMode::LORA) {
         float symbolTime = (1 << currentSF) / (currentBW * 1000);
         float preambleTime = (8 + 4.25f) * symbolTime;
 
-        float payloadSymbols = 8.0f + std::max(ceil((8.0f * 50 - 4.0f * currentSF + 28 + 16) /
-                                                    (4.0f * (currentSF - 2))),
-                                               0.0f) *
-                                          currentCR;
+        float payloadSymbols = 8.0f + 
+                                std::max(
+                                    ceil((8.0f * 50 - 4.0f * currentSF + 28 + 16) / (4.0f * (currentSF - 2))), 
+                                    0.0f) 
+                                    * currentCR;
         float packetTime = (preambleTime + payloadSymbols * symbolTime) * 1000;
 
         currentRetryTimeoutMs = std::max(8500U, (uint32_t)(packetTime * 3.5f + 1000));
-        if (currentSF <= 7)
-        {
+        if (currentSF <= 7) {
             BULK_ACK_INTERVAL_MS = 1800;
             BULK_ACK_MAX_WAIT_MS = 1200;
             currentMaxRetries = 2;
-        }
-        else if (currentSF <= 9)
-        {
+        } else if (currentSF <= 9) {
             BULK_ACK_INTERVAL_MS = 2500;
             BULK_ACK_MAX_WAIT_MS = 1500;
             currentMaxRetries = 3;
-        }
-        else
-        {
+        } else {
             BULK_ACK_INTERVAL_MS = 3000;
             BULK_ACK_MAX_WAIT_MS = 1800;
             currentMaxRetries = 4;
         }
 
-        char s[120];
-        snprintf(s, sizeof(s), "\r\n\r\n---------------\r\nAdaptive [LoRa] retry: SF%d → timeout=%ums, retries=%u (pkt≈%.1fms) BULK_ACK_INTERVAL_MS=%ums, BULK_ACK_MAX_WAIT_MS=%ums\r\n\n",
-                 currentSF, currentRetryTimeoutMs, currentMaxRetries, packetTime, BULK_ACK_INTERVAL_MS, BULK_ACK_MAX_WAIT_MS);
+        snprintf(s, sizeof(s), "[LoRa] retry: SF%d → timeout=%ums, retries=%u (pkt≈%.1fms)", currentSF, currentRetryTimeoutMs, currentMaxRetries, packetTime);
         putToLogBuffer(String(s));
     }
     else if (_mode == RadioMode::FSK)
     {
         float packetTime = (50.0f * 8.0f * 1000.0f) / currentBitrate;
         currentRetryTimeoutMs = std::max(1500U, (uint32_t)(packetTime * 2.5f + 600));
-        if (currentBitrate >= 19200)
-        {
+        if (currentBitrate >= 19200) {
             currentMaxRetries = 2;
-        }
-        else
-        {
+        } else {
             currentMaxRetries = 3;
         }
         BULK_ACK_INTERVAL_MS = 600;
         BULK_ACK_MAX_WAIT_MS = 250;
 
-        char s[120];
-        snprintf(s, sizeof(s), "\r\n\r\n---------------\r\nAdaptive [FSK] retry: %ukbps → timeout=%ums, retries=%u (pkt≈%.1fms) BULK_ACK_INTERVAL_MS=%ums, BULK_ACK_MAX_WAIT_MS=%ums\r\n\n",
-                 currentBitrate / 1000, currentRetryTimeoutMs, currentMaxRetries, packetTime, BULK_ACK_INTERVAL_MS, BULK_ACK_MAX_WAIT_MS);
+        snprintf(s, sizeof(s), "[FSK] retry: %ukbps → timeout=%ums, retries=%u (pkt≈%.1fms)",
+                 currentBitrate / 1000, currentRetryTimeoutMs, currentMaxRetries, packetTime);
         putToLogBuffer(String(s));
     }
+    putToLogBuffer(String("Curent profile=") + getCurrentProfileIndex());
+    putToLogBuffer(String("Curent Bitrate   :") + currentBitrate + "bps");
+    putToLogBuffer(String("Curent Bandwidth :") + currentBW + "kHz");
+    putToLogBuffer(String("Curent Coding Rate:") + currentCR);
+    putToLogBuffer(String("Curent Spreading Factor:") + currentSF);
+    putToLogBuffer(String("Curent Frequency :") + currentFreq + "mHz");
+    putToLogBuffer(String("Curent currentRetryTimeoutMs :") + getCurrentRetryTimeout() + "ms");
+    putToLogBuffer(String("Curent currentMaxRetries:") + getCurrentMaxRetries());
+    putToLogBuffer(String("Curent currentDeviation:") + currentDeviation);
+    putToLogBuffer(String("BULK_ACK_INTERVAL_MS=") + BULK_ACK_INTERVAL_MS + "ms");
+    putToLogBuffer(String("BULK_ACK_MAX_WAIT_MS=") + BULK_ACK_MAX_WAIT_MS +"ms");
+    putToLogBuffer(String("-----------------------------------"));
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TASK IMPLEMENTATIONS
@@ -683,26 +704,20 @@ void LoRaCore::updateRetryParameters()
 
 void LoRaCore::logTask()
 {
-    while (true)
-    {
-        if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(500)) == pdTRUE)
-        {
-            if (!logBuffer.empty())
-            {
+    while (true) {
+        if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (!logBuffer.empty()) {
                 std::vector<String> logsToProcess = logBuffer;
                 logBuffer.clear();
                 xSemaphoreGive(logMutex);
-                for (const auto &logEntry : logsToProcess)
-                {
+                for (const auto &logEntry : logsToProcess) {
                     Serial.println(logEntry);
                 }
-            }
-            else
-            {
+            } else {
                 xSemaphoreGive(logMutex);
             }
         }
-        uint32_t randomDelay = 21 + (esp_random() % 29);
+        uint32_t randomDelay = 21 + lc_randomRange(0, 28);
         vTaskDelay(pdMS_TO_TICKS(randomDelay));
     }
 }
@@ -712,20 +727,17 @@ void LoRaCore::receiveTask()
     static char s[200];
     static String fullLog = "";
 
-    while (true)
-    {
+    while (true) {
         LoRaPacket pkt = {};
         fullLog = "";
         receivingInProgress = true;
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (radioSemaphore && xSemaphoreTake(radioSemaphore, 0) == pdTRUE)
-        {
+        if (radioSemaphore && xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
 
             unsigned long t0 = millis();
             int len = radio.getPacketLength();
 
-            if (len > 0 && len <= sizeof(LoRaPacket))
-            {
+            if (len > 0 && len <= sizeof(LoRaPacket)) {
                 if (len < offsetof(LoRaPacket, payload)){
                     radio.startReceive();
                     if (radioSemaphore)
@@ -733,7 +745,7 @@ void LoRaCore::receiveTask()
                     receivingInProgress = false;
                     char shortLog[80];
                     _rx_errors++;
-                    snprintf(shortLog, sizeof(shortLog), "🚫 PACKET TOO SHORT: len=%d < header_size=%d", len, (int)offsetof(LoRaPacket, payload));
+                    snprintf(shortLog, sizeof(shortLog), "[ERROR] PACKET TOO SHORT: len=%d < header_size=%d", len, (int)offsetof(LoRaPacket, payload));
                     putToLogBuffer(String(shortLog));
                     continue;
                 }
@@ -763,39 +775,25 @@ void LoRaCore::receiveTask()
                 if (pkt.payloadLen > MAX_LORA_PAYLOAD) { payloadHex = "❌CORRUPTED_LEN=" + String(pkt.payloadLen); }
                 else if (pkt.payloadLen > 30) { payloadHex += "...";}
 
-                unsigned long uptime = millis();
-                unsigned long seconds = uptime / 1000;
-                unsigned long milliseconds = uptime % 1000;
-                unsigned long minutes = seconds / 60;
-                unsigned long hours = minutes / 60;
-                seconds = seconds % 60;
-                minutes = minutes % 60;
-                
-                char timestamp[32];
-                snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu.%03lu]", hours, minutes, seconds, milliseconds);
-
-                snprintf(s, sizeof(s), "[TxRxQ:%d/%d P:%d][RX:%d][L:%d]%lums→[%u->%u], T=[%c/%d], id:%u,  state:%d, %u", getOutgoingQueueCount(), getIncomingQueueCount(), pending.size(), getCurrentProfileIndex(), len, t1 - t0, pkt.getSenderId(), pkt.getReceiverId(), pkt.packetType, pkt.packetType, pkt.packetId,crcState, pkt.payloadLen);
-                fullLog = String(timestamp) + String(s) + ":[" + payloadHex + "]";
+                snprintf(s, sizeof(s), "[P:%d][RX on %d][L:%d]%lums→[%u->%u], T=[%d], id:%u,  state:%d, %u", pending.size(), getCurrentProfileIndex(), len, t1 - t0, pkt.getSenderId(), pkt.getReceiverId(), pkt.packetType, pkt.packetId,crcState, pkt.payloadLen);
+                fullLog = String(s) + ":[" + payloadHex + "]";
                 putToLogBuffer(fullLog);
-                if (pkt.packetType == CMD_ACK)
-                {
-                    handleAck(pkt);
+                if (pkt.packetType == CMD_ACK && !pkt.isAckRequired()) { handleAck(pkt); } 
+                else if(pkt.packetType == CMD_BULK_ACK && !pkt.isAckRequired()) { handleBulkAck(pkt); }
+                else {
+                    if (pkt.isAckRequired()) {
+                        addAckToBulk(pkt.packetId, pkt.getSenderId());
+                        if(pkt.isHighPriority()){ flushBulkAck(pkt.getSenderId()); }
+                    }
+                    if(pkt.isHighPriority()){ xQueueSendToFront(incomingQueue, &pkt, 10); } 
+                    else { xQueueSendToBack(incomingQueue, &pkt, 500); }
                 }
-                else if(pkt.packetType == CMD_BULK_ACK)
-                {
-                    handleBulkAck(pkt);
-                }
-                else
-                {
-                    xQueueSendToBack(incomingQueue, &pkt, 0);
-                }
-            }
-            else
-            {
+            } else {
                 _rx_errors++;
                 radio.startReceive();
-                if (radioSemaphore)
-                    xSemaphoreGive(radioSemaphore);
+                if (radioSemaphore) { 
+                    xSemaphoreGive(radioSemaphore); 
+            }
 
                 receivingInProgress = false;
             }
@@ -806,21 +804,16 @@ void LoRaCore::receiveTask()
 void LoRaCore::sendTask()
 {
     static char s[200];
+    unsigned int send_in_row = 0;
     while (true)
     {
         LoRaPacket pkt = {};
-        if (xQueueReceive(outgoingQueue, &pkt, pdMS_TO_TICKS(50)) == pdTRUE){
+        if (xQueueReceive(outgoingQueue, &pkt, pdMS_TO_TICKS(500)) == pdTRUE){
 
             LoRaPacket txPkt = pkt;
-            unsigned long t0 = millis();
             ssize_t len = offsetof(LoRaPacket, payload) + pkt.payloadLen;
-
-            xSemaphoreTake(radioSemaphore, portMAX_DELAY);
-            radio.standby();
-            int result = radio.transmit((uint8_t *)&txPkt, len);
-            radio.startReceive();
-            
-            xSemaphoreGive(radioSemaphore);
+            unsigned long t0 = millis();
+            int result = transmitPacket(&txPkt, len);
             unsigned long txDuration = millis() - t0;
 
             String payloadHex = "";
@@ -832,48 +825,46 @@ void LoRaCore::sendTask()
             }
             if (pkt.payloadLen > MAX_LORA_PAYLOAD) { payloadHex = "❌CORRUPTED_LEN=" + String(pkt.payloadLen); }
 
-            unsigned long uptime = millis();
-            unsigned long seconds = uptime / 1000;
-            unsigned long milliseconds = uptime % 1000;
-            unsigned long minutes = seconds / 60;
-            unsigned long hours = minutes / 60;
-            seconds = seconds % 60;
-            minutes = minutes % 60;
-            
-            char timestamp[32];
-            snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu.%03lu]", hours, minutes, seconds, milliseconds);
-
             snprintf(s, sizeof(s), "[TxRxQ:%d/%d P:%d][TX:%d][L:%d]%lums→[%u->%u], T=[%c/%d], id=%u, %u:[", getOutgoingQueueCount(), getIncomingQueueCount(), pending.size(), getCurrentProfileIndex(), (int)len, txDuration, pkt.getSenderId(), pkt.getReceiverId(), pkt.packetType, pkt.packetType, pkt.packetId, pkt.payloadLen);
-            String fullLog = String(timestamp) + String(s) + payloadHex + "]";
-            putToLogBuffer(fullLog);
+            putToLogBuffer( String(s) + payloadHex + "]");
 
             if (result != RADIOLIB_ERR_NONE){
-                snprintf(s, sizeof(s), "❌TX Error: code=%d, id=%u, len=%d, duration=%lums", result, pkt.packetId, (int)len, txDuration);
+                snprintf(s, sizeof(s),  "[ERROR] TX Error: code=%d, id=%u, len=%d, duration=%lums", result, pkt.packetId, (int)len, txDuration);
                 putToLogBuffer(String(s));
                 _tx_errors++;
             }
 
             if (pkt.payloadLen != txPkt.payloadLen){
-                char corruptionBuf[100];
-                snprintf(corruptionBuf, sizeof(corruptionBuf), "🚨 CORRUPTION: orig_len=%u, tx_len=%u", pkt.payloadLen, txPkt.payloadLen);
-                putToLogBuffer(corruptionBuf);
+                char corruptionBuf[50];
+                snprintf(s, sizeof(corruptionBuf), "[ERROR] TX Error: CORRUPTION: orig_len=%u, tx_len=%u", pkt.payloadLen, txPkt.payloadLen);
+                putToLogBuffer(String(corruptionBuf));
             }
-            if (txDuration > 300){
+            if (txDuration > 900){
+                vTaskDelay(pdMS_TO_TICKS(txDuration * 3.5));
+            } else if (txDuration > 600){
+                vTaskDelay(pdMS_TO_TICKS(txDuration * 3));
+            } else if (txDuration > 300){
                 vTaskDelay(pdMS_TO_TICKS(txDuration * 2));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS((txDuration+2)/2));
+            }
+            send_in_row++;
+            if (send_in_row >= 9) {
+                send_in_row = 0;
+                vTaskDelay(pdMS_TO_TICKS(15 + lc_randomRange(0, 20)));
             }
             
         } else {
-            uint32_t randomDelay = 19 + (esp_random() % 10);
+            send_in_row = 0;
+            uint32_t randomDelay = lc_randomRange(10, 50);
             if (currentProfileIndex < 4){
+                randomDelay += lc_randomRange(10, 20);
                 if (currentProfileIndex < 2){
-                    randomDelay += 20 + (esp_random() % 50);
-                } else {
-                    randomDelay += 10 + (esp_random() % 25);
+                    randomDelay += lc_randomRange(20, 49);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(randomDelay));
         }
-
     }
 }
 
@@ -909,7 +900,7 @@ void LoRaCore::resendTask()
             }
             xSemaphoreGive(pendingMutex);
         }
-        uint32_t randomDelay = 211 + (esp_random() % 100);
+        uint32_t randomDelay = 211 + lc_randomRange(0, 99);
         vTaskDelay(pdMS_TO_TICKS(randomDelay));
     }
 }
@@ -958,48 +949,40 @@ bool LoRaCore::applyProfileFromSettings(uint8_t profileIndex)
             vTaskDelay(pdMS_TO_TICKS(400));
             
             result = radio.setModem(RADIOLIB_MODEM_FSK);
-            if (result != RADIOLIB_ERR_NONE)
-            {
+            if (result != RADIOLIB_ERR_NONE) {
                 LLog("LoRaCore: GFSK setModem error: " + String(result));
                 xSemaphoreGive(radioSemaphore);
                 return false;
             }
             result = radio.setFrequency(currentFreq);
-            if (result != RADIOLIB_ERR_NONE)
-            {
+            if (result != RADIOLIB_ERR_NONE) {
                 LLog("LoRaCore: GFSK setFrequency error: " + String(result));
                 xSemaphoreGive(radioSemaphore);
                 return false;
             }
             
             result = radio.setBitRate(profile.bitrate / 1000.0f);
-            if (result == RADIOLIB_ERR_NONE)
-            {
+            if (result == RADIOLIB_ERR_NONE) {
                 LLog("LoRaCore: GFSK setBitRate успешно, используем классический подход");
 
                 result = radio.setFrequencyDeviation(profile.deviation / 1000.0f);
-                if (result != RADIOLIB_ERR_NONE)
-                {
+                if (result != RADIOLIB_ERR_NONE) {
                     LLog("LoRaCore: GFSK setFrequencyDeviation error: " + String(result));
                     xSemaphoreGive(radioSemaphore);
                     return false;
                 }
 
                 result = radio.setRxBandwidth(profile.bandwidth);
-                if (result != RADIOLIB_ERR_NONE)
-                {
+                if (result != RADIOLIB_ERR_NONE) {
                     LLog("LoRaCore: GFSK setRxBandwidth error: " + String(result) +
                          " (trying to set " + String(profile.bandwidth, 1) + "kHz)");
                     xSemaphoreGive(radioSemaphore);
                     return false;
                 }
-            }
-            else
-            {
+            } else {
                 LLog("LoRaCore: setBitRate не поддерживается, пробуем beginFSK...");
 
-                if (profile.bitrate < 4800)
-                {
+                if (profile.bitrate < 4800) {
                     LLog("LoRaCore: GFSK bitrate " + String(profile.bitrate) + " below SX1262 minimum (4800)");
                     xSemaphoreGive(radioSemaphore);
                     return false;
@@ -1007,8 +990,7 @@ bool LoRaCore::applyProfileFromSettings(uint8_t profileIndex)
                 
                 result = radio.beginFSK(profile.bitrate / 1000.0f, profile.deviation / 1000.0f,
                                         profile.bandwidth, 32, 10.0f, false);
-                if (result != RADIOLIB_ERR_NONE)
-                {
+                if (result != RADIOLIB_ERR_NONE) {
                     LLog("LoRaCore: GFSK beginFSK error: " + String(result) +
                          " (bitrate=" + String(profile.bitrate / 1000.0f, 1) + "kbps" +
                          ", dev=" + String(profile.deviation / 1000.0f, 1) + "kHz" +
@@ -1019,14 +1001,11 @@ bool LoRaCore::applyProfileFromSettings(uint8_t profileIndex)
             }
             
             result = radio.setCRC(true);
-            if (result != RADIOLIB_ERR_NONE)
-            {
+            if (result != RADIOLIB_ERR_NONE) {
                 LLog("LoRaCore: GFSK setCRC error: " + String(result));
                 xSemaphoreGive(radioSemaphore);
                 return false;
-            }
-            else
-            {
+            } else {
                 LLog("LoRaCore: GFSK setCRC успешно");
             }
 
@@ -1039,14 +1018,8 @@ bool LoRaCore::applyProfileFromSettings(uint8_t profileIndex)
             updateRetryParameters();
         }
 
-        if (stat)
-        {
-            radio.startReceive();
-        }
-        else
-        {
-            LLog("LoRaCore: Ошибка применения профиля " + String(profileIndex));
-        }
+        if (stat) { radio.startReceive(); }
+        else { LLog("LoRaCore: Ошибка применения профиля " + String(profileIndex)); }
 
         xSemaphoreGive(radioSemaphore);
         return stat;
@@ -1056,25 +1029,16 @@ bool LoRaCore::applyProfileFromSettings(uint8_t profileIndex)
     return false;
 }
 
-String LoRaCore::getCurrentProfileInfo() const
-{
-    if (_mode == RadioMode::LORA)
-    {
+String LoRaCore::getCurrentProfileInfo() const {
+    if (_mode == RadioMode::LORA) {
         return "LoRa #" + String(currentProfileIndex) + ": SF=" + String(currentSF) + ", CR=" + String(currentCR) + ", BW=" + String(currentBW, 1) + "kHz";
-    }
-    else
-    {
+    } else {
         return "FSK #" + String(currentProfileIndex) + ": " + String(currentBitrate / 1000.0f, 1) + "kb/s" + ", dev=" + String(currentDeviation / 1000.0f, 1) + "k" + ", bw=" + String(currentBW, 1) + "k";
     }
 }
 
 
-
-
-
-//////
-bool LoRaCore::applyLoRa(const LoRaProfile &p)
-{
+bool LoRaCore::applyLoRa(const LoRaProfile &p) {
     bool success = radio.setModem(RADIOLIB_MODEM_LORA) == RADIOLIB_ERR_NONE &&
                    radio.setFrequency(currentFreq) == RADIOLIB_ERR_NONE &&
                    radio.setSpreadingFactor(p.sf) == RADIOLIB_ERR_NONE &&
@@ -1084,8 +1048,7 @@ bool LoRaCore::applyLoRa(const LoRaProfile &p)
                    radio.setCRC(true) == RADIOLIB_ERR_NONE &&
                    radio.setOutputPower(currentTX) == RADIOLIB_ERR_NONE;
 
-    if (success)
-    {
+    if (success) {
         currentSF = p.sf;
         currentCR = p.cr;
         currentBW = p.bw;
@@ -1094,16 +1057,13 @@ bool LoRaCore::applyLoRa(const LoRaProfile &p)
     return success;
 }
 
-bool LoRaCore::applyFSK(const FSKProfile &p)
-{
+bool LoRaCore::applyFSK(const FSKProfile &p) {
     int result = radio.beginFSK(p.bitrate / 1000.0f, p.deviation / 1000.0f, p.rxBw / 1000.0f, 4);
-    if (result != RADIOLIB_ERR_NONE)
-    {
+    if (result != RADIOLIB_ERR_NONE) {
         return false;
     }
     bool success = radio.setCRC(true) == RADIOLIB_ERR_NONE;
-    if (success)
-    {
+    if (success) {
         currentBitrate = p.bitrate;
         currentDeviation = p.deviation;
         currentBW = p.rxBw;
@@ -1112,10 +1072,8 @@ bool LoRaCore::applyFSK(const FSKProfile &p)
     return success;
 }
 
-void LoRaCore::putToLogBuffer(const String &msg)
-{
-    if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(2)) == pdTRUE)
-    {
+void LoRaCore::putToLogBuffer(const String &msg) {
+    if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
         unsigned long uptime = millis();
         unsigned long seconds = uptime / 1000;
         unsigned long milliseconds = uptime % 1000;
@@ -1125,27 +1083,122 @@ void LoRaCore::putToLogBuffer(const String &msg)
         minutes = minutes % 60;
 
         char timestamp[32];
-        snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu.%03lu] ", 
-        hours, minutes, seconds, milliseconds);
-        logBuffer.push_back(msg);
-        if (logBuffer.size() > MAX_LOG_BUFFER_SIZE)
-        {
+        snprintf(timestamp, sizeof(timestamp), "[%02lu:%02lu:%02lu.%03lu] ",  hours, minutes, seconds, milliseconds);
+        logBuffer.push_back(String(timestamp) + msg);
+        if (logBuffer.size() > MAX_LOG_BUFFER_SIZE) {
             logBuffer.erase(logBuffer.begin());
         }
         xSemaphoreGive(logMutex);
     }
 }
 
-bool LoRaCore::switchTo(RadioMode m)
-{
+bool LoRaCore::switchTo(RadioMode m) {
     if (m == _mode)
         return true;
     bool ok = (m == RadioMode::LORA) ? applyLoRa(_loraLong) : applyFSK(_fskFast);
-    if (ok)
-    {
+    if (ok) {
         _mode = m;
-        LLog(String("LoRaCore: Switched to ") + (m == RadioMode::LORA ? "LoRa" : "GFSK"));
+        LLog(String("[Warning] LoRaCore: Switched to ") + (m == RadioMode::LORA ? "[LoRa]" : "[GFSK]"));
         radio.startReceive();
     }
     return ok;
+}
+
+// -----------------------------------------------------------------------------
+PacketId_t LoRaCore::sendAsaRequest(uint8_t profileIndex, LoraAddress_t receiver) {
+    PacketAsaExchange pkt(CMD_REQUEST_ASA);
+    pkt.setProfile(profileIndex);
+
+    // Create proper payload buffer instead of relying on memory layout
+    uint8_t payload[1];
+    payload[0] = pkt.profileIndex;
+
+    return sendPacketBase(receiver, pkt, payload);
+}
+
+PacketId_t LoRaCore::sendAsaResponse(uint8_t profileIndex, LoraAddress_t receiver) {
+    PacketAsaExchange pkt(CMD_RESPONCE_ASA);
+    pkt.setProfile(profileIndex);
+
+    // Create proper payload buffer instead of relying on memory layout
+    uint8_t payload[1];
+    payload[0] = pkt.profileIndex;
+
+    return sendPacketBase(receiver, pkt, payload);
+}
+
+// -----------------------------------------------------------------------------
+bool LoRaCore::handleAsaRequest(const LoRaPacket *pkt) {
+    if (pkt->packetType != CMD_REQUEST_ASA || pkt->payloadLen != 1) {
+        return false;
+    }
+    
+    uint8_t requestedProfile = pkt->payload[0];
+    LLog("[ASA]request received: profile " + String(requestedProfile) + " from device " + String(pkt->getSenderId()));
+    
+    if (requestedProfile == getCurrentProfileIndex()) {
+        LLog("[ASA]✓ Requested profile " + String(requestedProfile) + " is already active. No switch needed.");
+        return true;
+    } 
+    else if (requestedProfile < LORA_PROFILE_COUNT) {
+        // Send ASA response on CURRENT profile
+        LLog("[ASA]Sending ASA response for profile " + String(requestedProfile) + " (staying on current profile for now)...");
+        sendAsaResponse(requestedProfile, pkt->getSenderId());
+        
+        // Schedule profile switch after delay
+        pendingAsaProfile = requestedProfile;
+        asaResponseSentTime = millis();
+        LLog("[ASA]⏳ Will switch to profile " + String(requestedProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+        return true;
+    } else {
+        LLog("[ASA]✗ Invalid profile index: " + String(requestedProfile) + " (max: " + String(LORA_PROFILE_COUNT-1) + ")");
+        return false;
+    }
+}
+
+// -----------------------------------------------------------------------------
+bool LoRaCore::handleAsaResponse(const LoRaPacket* pkt) {
+    if (pkt->packetType != CMD_RESPONCE_ASA || pkt->payloadLen != 1) {
+        return false;
+    }
+    
+    uint8_t responseProfile = pkt->payload[0];
+    LLog("[ASA]response received: profile " + String(responseProfile) + " from device " + String(pkt->getSenderId()));
+    
+    // Schedule profile switch after delay (to allow ACK to be sent)
+    pendingAsaProfile = responseProfile;
+    asaResponseReceivedTime = millis();
+    LLog("[ASA]⏳ Will switch to profile " + String(responseProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+    
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+bool LoRaCore::processAsaProfileSwitch() {
+    if (pendingAsaProfile < 0) {
+        return false; // No pending profile switch
+    }
+    
+    // Check if enough time has passed (using the most recent timestamp)
+    unsigned long lastAsaTime = max(asaResponseSentTime, asaResponseReceivedTime);
+    if (millis() - lastAsaTime <= ASA_SWITCH_DELAY) {
+        return false; // Not ready yet
+    }
+    
+    // Time to switch!
+    LLog("[ASA]⚡ Switching to ASA profile " + String(pendingAsaProfile) + " now...");
+    bool success = applyProfileFromSettings(pendingAsaProfile);
+    
+    if (success) {
+        LLog("[ASA]✓ ASA profile applied successfully");
+        LLog("[ASA]" + getCurrentProfileInfo());
+    } else {
+        LLog("[ASA]✗ Failed to apply ASA profile");
+    }
+    
+    pendingAsaProfile = -1; // Clear pending state
+    asaResponseSentTime = 0;
+    asaResponseReceivedTime = 0;
+    
+    return success;
 }

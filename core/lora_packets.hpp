@@ -10,7 +10,6 @@
 #include "packets/packet_telemetry.hpp"
 #include "packets/packet_info_engine.hpp"
 #include "packets/packet_rssi_report.hpp"
-#include "packets/packet_status.hpp"
 #include "packets/packet_ack.hpp"
 #include "packets/packet_bulk_ack.hpp"
 #include "packets/packet_config.hpp"

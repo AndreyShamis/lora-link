@@ -2,6 +2,8 @@
 // LoRaCore.hpp - Unified LoRa Communication System
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <random>
+
 #include <SPI.h>
 #include <vector>
 #include <functional>
@@ -13,9 +15,42 @@
 void LLog(const char *s);
 void LLog(const String &s);
 
+// Универсальный случайный 32-битный для Arduino/ESP
+static uint32_t lc_random32() {
+#if defined(ESP32)
+    // На ESP32 — аппаратный RNG, самый честный
+    return esp_random();
+#else
+    // На обычных Arduino/STM32 — лёгкий LCG
+    static uint32_t seed = 0;
+
+    if (seed == 0) {
+        // Инициализируем от времени/аналога, чтобы не было фиксированного старта
+        seed = micros();
+        // Если есть хоть какой-то аналоговый пин — можно чуть улучшить
+        // seed ^= (uint32_t)analogRead(A0);
+    }
+
+    // Классический linear congruential generator
+    seed = 1103515245UL * seed + 12345UL;
+    return seed;
+#endif
+}
+
+// Диапазон [min, max] включительно
+static uint32_t lc_randomRange(uint32_t minVal, uint32_t maxVal) {
+    if (maxVal <= minVal) return minVal;
+    uint32_t span = maxVal - minVal + 1;
+    return minVal + (lc_random32() % span);
+}
+
+
+
 class LoRaCore
 {
 private:
+    static TaskHandle_t receiverTaskHandle;
+    static TaskHandle_t senderTaskHandle;
     LoraAddress_t srcAddress;     // Current source address (can be changed)
     LoraAddress_t dstAddress;     // Default destination address (can be changed)
     Module *_module;
@@ -23,7 +58,12 @@ private:
     QueueHandle_t incomingQueue = nullptr;
     QueueHandle_t outgoingQueue = nullptr;
     SemaphoreHandle_t radioSemaphore = nullptr;
-    static TaskHandle_t receiverTaskHandle;
+    
+    unsigned long asaResponseSentTime = 0;
+    unsigned long asaResponseReceivedTime = 0;
+    int pendingAsaProfile = -1; // -1 means no pending profile switch
+    static const unsigned long ASA_SWITCH_DELAY = 4000; // Wait 4 seconds after response before switching
+
     std::vector<PendingSend> pending;
     SemaphoreHandle_t pendingMutex = nullptr;                                // Мьютекс для pending vector
     std::function<void(PacketId_t, LoraAddress_t, uint8_t)> ackCallback = nullptr; // callback(packetId, senderId, packetType)
@@ -89,8 +129,16 @@ public:
     RadioMode mode() const { return _mode;}
     SX1262 &getRadio() { return radio;}
     bool removePendingPacket(PacketId_t );  // Метод для принудительного удаления пакета из pending списка (например, при успешном ASA ответе)
-    PacketId_t sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload, bool waitForAck = true, bool highPriority=false);
-
+    PacketId_t sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload);
+    PacketId_t sendAsaResponse(uint8_t profileIndex, LoraAddress_t receiver);
+    PacketId_t sendAsaRequest(uint8_t profileIndex, LoraAddress_t receiver);
+    
+    bool handleAsaRequest(const LoRaPacket *pkt);   // Handle ASA request packet and schedule profile switch
+    bool handleAsaResponse(const LoRaPacket *pkt);  // Handle ASA response packet and schedule profile switch
+    
+    // Process pending ASA profile switch (call in main loop)
+    bool processAsaProfileSwitch();
+    
     LoRaCore(LoraAddress_t deviceId, LoraAddress_t defaultDestination = 0)
         : srcAddress(deviceId),
           dstAddress(defaultDestination),
@@ -121,6 +169,9 @@ public:
 
     static void onReceive()
     {
+        if (receiverTaskHandle == nullptr) {
+            return;
+        }
         // STATIC INTERRUPT HANDLER
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         vTaskNotifyGiveFromISR(receiverTaskHandle, &xHigherPriorityTaskWoken);
@@ -136,81 +187,62 @@ public:
         ackCallback = std::move(callback);
     }
 
-    void clearAckCallback()
-    {
+    void clearAckCallback() {
         ackCallback = nullptr;
     }
 
-
     // Низкоуровневая отправка без ACK и повторов (для служебных пакетов)
-    bool send(const LoRaPacket &pkt)
-    {
+    bool send(const LoRaPacket &pkt) {
         if (!outgoingQueue)
             return false;
         return xQueueSendToBack(outgoingQueue, &pkt, 0) == pdTRUE;
     }
 
-    bool receive(LoRaPacket &pkt)
-    {
+    bool receive(LoRaPacket &pkt) {
         if (!incomingQueue)
             return false;
         return xQueueReceive(incomingQueue, &pkt, 0) == pdTRUE;
     }
 
-    // DIAGNOSTIC AND MAINTENANCE METHODS
-
     // Получить текущий ID (без инкремента) - только для диагностики
-    PacketId_t getCurrentPacketId() const
-    {
+    PacketId_t getCurrentPacketId() const {
         return nextPacketId;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // BULK ACK MANAGEMENT
-    // ═══════════════════════════════════════════════════════════════════════════
 
     // Добавить ACK в bulk пакет (публичный интерфейс)
-    void addAckToBulk(PacketId_t packetId, uint8_t targetDeviceId)
-    {
+    void addAckToBulk(PacketId_t packetId, uint8_t targetDeviceId) {
         addToBulkAck(packetId, targetDeviceId);
     }
 
     // Принудительно отправить накопленные ACK
-    void flushBulkAck(uint8_t targetDeviceId)
-    {
+    void flushBulkAck(uint8_t targetDeviceId) {
         sendBulkAck(targetDeviceId);
     }
 
     // Проверить таймаут bulk ACK (вызывать в главном цикле)
-    void processBulkAckTimeout(uint8_t targetDeviceId)
-    {
+    void processBulkAckTimeout(uint8_t targetDeviceId) {
         checkBulkAckTimeout(targetDeviceId);
     }
 
-    size_t getPendingCount() const
-    {
+    size_t getPendingCount() const {
         if (!pendingMutex)
             return 0;
         size_t count = 0;
-        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(5)) == pdTRUE)
-        {
+        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             count = pending.size();
             xSemaphoreGive(pendingMutex);
         }
         return count;
     }
 
-    bool isPacketPending(PacketId_t packetId) const
-    {
+    bool isPacketPending(PacketId_t packetId) const {
         if (!pendingMutex)
             return false;
         bool isPending = false;
-        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(5)) == pdTRUE)
-        {
-            for (const auto& p : pending)
-            {
-                if (p.pkt.packetId == packetId)
-                {
+        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            for (const auto& p : pending) {
+                if (p.pkt.packetId == packetId) {
                     isPending = true;
                     break;
                 }
@@ -220,99 +252,76 @@ public:
         return isPending;
     }
 
-    void clearPending()
-    {
-        if (pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(1100)) == pdTRUE)
-        {
+    void clearPending() {
+        if (pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(1100)) == pdTRUE) {
             pending.clear();
             xSemaphoreGive(pendingMutex);
         }
     }
 
-    size_t getLogBufferSize() const
-    {
+    size_t getLogBufferSize() const  {
         if (!logMutex)
             return 0;
         size_t count = 0;
-        if (xSemaphoreTake(logMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
+        if (xSemaphoreTake(logMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             count = logBuffer.size();
             xSemaphoreGive(logMutex);
         }
         return count;
     }
 
-    void clearLogBuffer()
-    {
-        if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(100)) == pdTRUE)
-        {
+    void clearLogBuffer() {
+        if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             logBuffer.clear();
             xSemaphoreGive(logMutex);
         }
     }
 
-    bool isHealthy() const
-    {
+    bool isHealthy() const {
         return incomingQueue != nullptr && outgoingQueue != nullptr && radioSemaphore != nullptr && pendingMutex != nullptr;
     }
 
-    // Диагностические методы для мониторинга очередей
-    size_t getIncomingQueueCount() const
-    {
+    size_t getIncomingQueueCount() const {
         return incomingQueue ? uxQueueMessagesWaiting(incomingQueue) : 0;
     }
 
-    size_t getOutgoingQueueCount() const
-    {
+    size_t getOutgoingQueueCount() const {
         return outgoingQueue ? uxQueueMessagesWaiting(outgoingQueue) : 0;
     }
 
-    size_t getIncomingQueueFree() const
-    {
+    size_t getIncomingQueueFree() const {
         return incomingQueue ? uxQueueSpacesAvailable(incomingQueue) : 0;
     }
 
-    size_t getOutgoingQueueFree() const
-    {
+    size_t getOutgoingQueueFree() const {
         return outgoingQueue ? uxQueueSpacesAvailable(outgoingQueue) : 0;
     }
 
-    String getQueueStatus() const
-    {
+    String getQueueStatus() const {
         return "TX:" + String(getOutgoingQueueCount()) + "/" + String(getOutgoingQueueCount() + getOutgoingQueueFree()) + ", RX:" + String(getIncomingQueueCount()) + "/" + String(getIncomingQueueCount() + getIncomingQueueFree()) + ", Pending:" + String(getPendingCount());
     }
 
-
-
-    String getAdaptiveRetryInfo() const
-    {
+    String getAdaptiveRetryInfo() const {
         return "Retries:" + String(currentMaxRetries) + ", Timeout:" + String(currentRetryTimeoutMs) + "ms" + " (" + ((_mode == RadioMode::LORA) ? "LoRa" : "FSK") + ")";
     }
 
-    // Диагностический метод для отображения текущих pending пакетов
-    String getPendingPacketsInfo() const
-    {
+    String getPendingPacketsInfo() const {
         if (!pendingMutex)
             return "No pending mutex";
 
         String result = "";
-        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(50)) == pdTRUE)
-        {
+        if (xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             result = "Pending(" + String(pending.size()) + "): ";
-            for (size_t i = 0; i < pending.size(); i++)
-            {
+            for (size_t i = 0; i < pending.size(); i++) {
                 if (i > 0)
                     result += ", ";
                 result += String(pending[i].pkt.packetId) + "#" + String(pending[i].retries);
             }
-            if (pending.empty())
-            {
+            if (pending.empty()) {
                 result += "empty";
             }
             xSemaphoreGive(pendingMutex);
-        }
-        else
-        {
+        } else {
             result = "Pending: mutex timeout";
         }
         return result;
@@ -342,10 +351,9 @@ public:
     
     // Send with default destination
     PacketId_t sendPacket(PacketBase &base, const uint8_t *payload, bool waitForAck = true) {
-        return sendPacketBase(dstAddress, base, payload, waitForAck);
+        base.ackRequired = waitForAck;
+        return sendPacketBase(dstAddress, base, payload);
     }
-
-
 
 private:
     // Task wrappers - implemented in .cpp
@@ -353,6 +361,7 @@ private:
     static void receiveTaskWrapper(void *param);
     static void sendTaskWrapper(void *param);
     static void resendTaskWrapper(void *param);
+
 
     void updateRetryParameters();
     bool applyLoRa(const LoRaProfile &p);
@@ -376,43 +385,27 @@ private:
     void receiveTask();
     void sendTask();
     void resendTask();
+    int transmitPacket(const LoRaPacket *txPkt, const size_t len);
+
+    static PacketBase PacketBaseFromLoRa(const LoRaPacket &pkt)
+    {
+        PacketBase b;
+        b.packetType = pkt.packetType;
+        b.packetId   = pkt.packetId;
+        b.payloadLen = pkt.payloadLen;
+
+        b.ackRequired       = pkt.isAckRequired();
+        b.highPriority      = pkt.isHighPriority();
+        b.service           = pkt.isService();
+        b.noRetry           = pkt.isNoRetry();
+        b.encrypted         = pkt.isEncrypted();
+        b.compressed        = pkt.isCompressed();
+        b.aggregated        = pkt.isAggregatedFrame();
+        b.internalLocalOnly = pkt.isInternalLocalOnly();
+        
+        return b;
+    }
 };
-
-// ═══════════════════════════════════════════════════════════════════════════
-// INLINE METHODS FOR PROFILE MANAGEMENT
-// ═══════════════════════════════════════════════════════════════════════════
-
-// -----------------------------------------------------------------------------
-// Утилиты ASA: отправка через экземпляр LoRaCore
-// -----------------------------------------------------------------------------
-
-inline PacketId_t sendAsaRequest(LoRaCore *loraCore, uint8_t profileIndex, LoraAddress_t receiver)
-{
-    if (!loraCore)
-        return 0;
-    PacketAsaExchange pkt(CMD_REQUEST_ASA);
-    pkt.setProfile(profileIndex);
-
-    // Create proper payload buffer instead of relying on memory layout
-    uint8_t payload[1];
-    payload[0] = pkt.profileIndex;
-
-    return loraCore->sendPacketBase(receiver, pkt, payload, true, true);
-}
-
-inline PacketId_t sendAsaResponse(LoRaCore *loraCore, uint8_t profileIndex, LoraAddress_t receiver)
-{
-    if (!loraCore)
-        return 0;
-    PacketAsaExchange pkt(CMD_REPOSNCE_ASA);
-    pkt.setProfile(profileIndex);
-
-    // Create proper payload buffer instead of relying on memory layout
-    uint8_t payload[1];
-    payload[0] = pkt.profileIndex;
-
-    return loraCore->sendPacketBase(receiver, pkt, payload, true, true);
-}
 
 // // Пример разбора входящего ASA пакета
 // inline bool parseAsaPacket(const PacketBase &hdr, const uint8_t *buf, uint8_t &outProfileIndex)

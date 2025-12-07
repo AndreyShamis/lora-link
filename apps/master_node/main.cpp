@@ -22,12 +22,6 @@ unsigned long heartbeatInterval = 5000; // 5 seconds default
 uint32_t heartbeatCounter = 0; // Persistent heartbeat counter
 PacketId_t lastHeartbeatPacketId = 0; // Track last heartbeat packet ID
 
-// ASA state tracking
-int pendingAsaProfile = -1; // -1 means no pending profile switch
-unsigned long asaResponseSentTime = 0;
-unsigned long asaResponseReceivedTime = 0;
-const unsigned long ASA_SWITCH_DELAY = 4000; // Wait 2.5 seconds after response received before switching
-
 // Buffered logging system
 std::vector<String> logBuffer;
 unsigned long lastLogFlushTime = 0;
@@ -112,7 +106,7 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         log("Sending PING...");
         PacketPing ping;
         uint8_t dummy = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy, true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy);
         packetsSent++;
         lastPingTime = millis();
         
@@ -120,11 +114,10 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         String msg = cmd.substring(5);
         log("Sending: " + msg);
         
-        PacketBase pkt;
-        pkt.packetType = CMD_COMMAND_STRING;
+        PacketCommand pkt;
         pkt.payloadLen = min((int)msg.length(), (int)MAX_LORA_PAYLOAD);
         
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str(), true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str());
         packetsSent++;
         
     } else if (cmd_lower.startsWith("profile ") || cmd_lower.startsWith("prof ")) {
@@ -273,27 +266,18 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         logf("Log entries: %d", lora->getLogBufferSize());
         log("==================\n");
         
-    } else if (cmd_lower == "request status") {
-        log("Requesting status from slave...");
-        PacketBase pkt;
-        pkt.packetType = CMD_REQUEST_INFO;
-        pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr, true);
-        packetsSent++;
-        
     } else if (cmd_lower == "request info") {
         log("Requesting info from slave...");
-        PacketBase pkt;
-        pkt.packetType = CMD_REQUEST_INFO;
+        PacketRequestInfo pkt;
         pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr, true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr);
         packetsSent++;
         
     } else if (cmd_lower.startsWith("asa ")) {
         int profileIndex = cmd.substring(4).toInt();
         if (profileIndex >= 0 && profileIndex < LORA_PROFILE_COUNT) {
             logf("Sending ASA request for profile %d...", profileIndex);
-            sendAsaRequest(lora, profileIndex, TARGET_DEVICE_ID);
+            lora->sendAsaRequest(profileIndex, TARGET_DEVICE_ID);
             packetsSent++;
         } else {
             logf("✗ Invalid profile. Use 0-%d", LORA_PROFILE_COUNT-1);
@@ -386,41 +370,14 @@ void processIncomingPackets() {
         }
         
         // Handle ASA response - DON'T apply yet, wait for ACK to be sent first
-        else if (pkt.packetType == CMD_REPOSNCE_ASA && pkt.payloadLen == 1) {
-            uint8_t responseProfile = pkt.payload[0];
-            logf("ASA response received: profile %d from device %d", responseProfile, pkt.getSenderId());
-            
-            // Schedule profile switch after delay (to allow ACK to be sent)
-            pendingAsaProfile = responseProfile;
-            asaResponseReceivedTime = millis();
-            logf("⏳ Will switch to profile %d in %lu ms", responseProfile, ASA_SWITCH_DELAY);
+        else if (pkt.packetType == CMD_RESPONCE_ASA) {
+            lora->handleAsaResponse(&pkt);
         }
         // Handle ASA request - respond with ASA response (DON'T switch yet!)
-        else if (pkt.packetType == CMD_REQUEST_ASA && pkt.payloadLen == 1) {
-            uint8_t requestedProfile = pkt.payload[0];
-            Serial.printf("ASA request received: profile %d from device %d\r\n", requestedProfile, pkt.getSenderId());
-            if (requestedProfile == lora->getCurrentProfileIndex()) {
-                Serial.printf("✓ Requested profile %d is already active. No switch needed.\r\n", requestedProfile);
-            } 
-            else if (requestedProfile < LORA_PROFILE_COUNT) {
-                // Send ASA response on CURRENT profile
-                Serial.printf("Sending ASA response for profile %d (staying on current profile for now)...\n", requestedProfile);
-                sendAsaResponse(lora, requestedProfile, pkt.getSenderId());
-                packetsSent++;
-                
-                // Schedule profile switch after delay
-                pendingAsaProfile = requestedProfile;
-                asaResponseSentTime = millis();
-                Serial.printf("⏳ Will switch to profile %d in %lu ms\r\n", requestedProfile, ASA_SWITCH_DELAY);
-            } else {
-                Serial.printf("✗ Invalid profile index: %d (max: %d)\r\n", requestedProfile, LORA_PROFILE_COUNT-1);
-            }
+        else if (pkt.packetType == CMD_REQUEST_ASA) {
+            lora->handleAsaRequest(&pkt);
         }
 
-        // Send ACK for non-ACK packets
-        if (pkt.packetType != CMD_ACK && pkt.packetType != CMD_BULK_ACK && pkt.packetType != CMD_HEARTBEAT && pkt.packetType != CMD_PONG) {
-            lora->addAckToBulk(pkt.packetId, pkt.getSenderId());
-        }
     }
 }
 
@@ -464,16 +421,7 @@ void loop() {
     lora->processBulkAckTimeout(TARGET_DEVICE_ID);
     
     // Process pending ASA profile switch
-    if (pendingAsaProfile >= 0 && (millis() - asaResponseReceivedTime > ASA_SWITCH_DELAY)) {
-        logf("⚡Switching to ASA profile %d now...", pendingAsaProfile);
-        if (lora->applyProfileFromSettings(pendingAsaProfile)) {
-            log("+ASA profile applied successfully");
-            log(lora->getCurrentProfileInfo());
-        } else {
-            log(" !Failed to apply ASA profile");
-        }
-        pendingAsaProfile = -1; // Clear pending state
-    }
+    lora->processAsaProfileSwitch();
     
     // Auto heartbeat
     if (autoHeartbeat && (millis() - lastHeartbeatTime > heartbeatInterval)) {
@@ -487,7 +435,7 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count, false); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count); // No ACK for heartbeat
             lastHeartbeatTime = millis();
             logf("[HB] Heartbeat sent #%lu", hb.count);
         } else {

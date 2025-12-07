@@ -16,8 +16,11 @@ public:
     uint32_t count; // arbitrary counter
     
     PacketHeartbeat() : count(0) {
-        packetType = CMD_HEARTBEAT; // or another suitable type for heartbeat
-        payloadLen = sizeof(count);
+        packetType      = CMD_HEARTBEAT; // or another suitable type for heartbeat
+        payloadLen      = sizeof(count);
+        ackRequired     = false;     // ACK не должен требовать ACK
+        highPriority    = false;     // ACK должен лететь немедленно
+        service         = false;          // служебный пакет
     }
 };
 

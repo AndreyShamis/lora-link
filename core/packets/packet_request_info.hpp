@@ -18,6 +18,9 @@ public:
     PacketRequestInfo() : requestType(0) {
         packetType = CMD_REQUEST_INFO;
         payloadLen = sizeof(requestType);
+        ackRequired = false;     // ACK не должен требовать ACK
+        highPriority = false;     // ACK должен лететь немедленно
+        service = false;          // служебный пакет
     }
 };
 

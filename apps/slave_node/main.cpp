@@ -26,12 +26,6 @@ unsigned long heartbeatInterval = 30000; // 30 seconds default
 uint32_t heartbeatCounter = 0; // Persistent heartbeat counter
 PacketId_t lastHeartbeatPacketId = 0; // Track last heartbeat packet ID
 
-// ASA state tracking
-int pendingAsaProfile = -1; // -1 means no pending profile switch
-unsigned long asaResponseSentTime = 0;
-unsigned long asaResponseReceivedTime = 0;
-const unsigned long ASA_SWITCH_DELAY = 4000; // Wait 2 seconds after response before switching
-
 // Boat mode settings
 bool boatMode = false;
 unsigned long lastActivityTime = 0;
@@ -51,7 +45,7 @@ void processSerialCommands() {
         Serial.println("Sending PING...");
         PacketPing ping;
         uint8_t dummy = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy, true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy);
         packetsSent++;
         lastPingTime = millis();
         lastActivityTime = millis();
@@ -60,11 +54,10 @@ void processSerialCommands() {
         String msg = cmd.substring(5);
         Serial.println("Sending: " + msg);
         
-        PacketBase pkt;
-        pkt.packetType = CMD_COMMAND_STRING;
+        PacketCommand pkt;
         pkt.payloadLen = min((int)msg.length(), (int)MAX_LORA_PAYLOAD);
         
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str(), true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str());
         packetsSent++;
         lastActivityTime = millis();
         
@@ -247,22 +240,12 @@ void processSerialCommands() {
         Serial.println("\n=== Log Buffer ===");
         Serial.printf("Log entries: %d\n", lora->getLogBufferSize());
         Serial.println("==================\n");
-        
-    } else if (cmd == "request status") {
-        Serial.println("Requesting status...");
-        PacketBase pkt;
-        pkt.packetType = CMD_REQUEST_INFO;
-        pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr, true);
-        packetsSent++;
-        lastActivityTime = millis();
-        
     } else if (cmd == "request info") {
         Serial.println("Requesting info...");
-        PacketBase pkt;
+        PacketRequestInfo pkt;
         pkt.packetType = CMD_REQUEST_INFO;
         pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr, true);
+        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr);
         packetsSent++;
         lastActivityTime = millis();
         
@@ -270,7 +253,7 @@ void processSerialCommands() {
         int profileIndex = cmd.substring(4).toInt();
         if (profileIndex >= 0 && profileIndex < LORA_PROFILE_COUNT) {
             Serial.printf("Sending ASA request for profile %d...\n", profileIndex);
-            sendAsaRequest(lora, profileIndex, TARGET_DEVICE_ID);
+            lora->sendAsaRequest(profileIndex, TARGET_DEVICE_ID);
             packetsSent++;
             lastActivityTime = millis();
         } else {
@@ -363,7 +346,7 @@ void processIncomingPackets() {
             Serial.println("PING received, sending PONG...");
             PacketPong pong;
             uint8_t dummy = 0;
-            lora->sendPacketBase(pkt.getSenderId(), pong, &dummy, false);
+            lora->sendPacketBase(pkt.getSenderId(), pong, &dummy);
             packetsSent++;
         }
         
@@ -383,50 +366,20 @@ void processIncomingPackets() {
             PacketBase echoPkt;
             echoPkt.packetType = CMD_COMMAND_STRING;
             echoPkt.payloadLen = min((int)echo.length(), (int)MAX_LORA_PAYLOAD);
-            lora->sendPacketBase(pkt.getSenderId(), echoPkt, (const uint8_t*)echo.c_str(), false);
+            lora->sendPacketBase(pkt.getSenderId(), echoPkt, (const uint8_t*)echo.c_str());
             packetsSent++;
         }
         
         // Handle ASA request - respond with ASA response (DON'T switch yet!)
-        else if (pkt.packetType == CMD_REQUEST_ASA && pkt.payloadLen == 1) {
-            uint8_t requestedProfile = pkt.payload[0];
-            Serial.printf("ASA request received: profile %d from device %d\r\n", requestedProfile, pkt.getSenderId());
-            if (requestedProfile == lora->getCurrentProfileIndex()) {
-                Serial.printf("✓ Requested profile %d is already active. No switch needed.\r\n", requestedProfile);
-            } 
-            else if (requestedProfile < LORA_PROFILE_COUNT) {
-                // Send ASA response on CURRENT profile
-                Serial.printf("Sending ASA response for profile %d (staying on current profile for now)...\n", requestedProfile);
-                sendAsaResponse(lora, requestedProfile, pkt.getSenderId());
-                packetsSent++;
-                
-                // Schedule profile switch after delay
-                pendingAsaProfile = requestedProfile;
-                asaResponseSentTime = millis();
-                Serial.printf("⏳ Will switch to profile %d in %lu ms\r\n", requestedProfile, ASA_SWITCH_DELAY);
-            } else {
-                Serial.printf("✗ Invalid profile index: %d (max: %d)\r\n", requestedProfile, LORA_PROFILE_COUNT-1);
-            }
+        else if (pkt.packetType == CMD_REQUEST_ASA) {
+            lora->handleAsaRequest(pkt, packetsSent);
         }
         
         // Handle ASA response - schedule profile switch
-        else if (pkt.packetType == CMD_REPOSNCE_ASA && pkt.payloadLen == 1) {
-            uint8_t responseProfile = pkt.payload[0];
-            Serial.printf("ASA response received: profile %d from device %d\r\n", responseProfile, pkt.getSenderId());
-            
-            // Schedule profile switch after delay (to allow ACK to be sent)
-            pendingAsaProfile = responseProfile;
-            asaResponseReceivedTime = millis();
-            Serial.printf("⏳ Will switch to profile %d in %lu ms\r\n", responseProfile, ASA_SWITCH_DELAY);
+        else if (pkt.packetType == CMD_RESPONCE_ASA) {
+            lora->handleAsaResponse(pkt);
         }
         
-        // Send ACK for non-ACK packets
-        if (pkt.packetType != CMD_ACK && 
-            pkt.packetType != CMD_BULK_ACK &&
-            pkt.packetType != CMD_HEARTBEAT &&
-            pkt.packetType != CMD_PONG) {
-            lora->addAckToBulk(pkt.packetId, pkt.getSenderId());
-        }
     }
 }
 
@@ -499,16 +452,7 @@ void loop() {
     lora->processBulkAckTimeout(TARGET_DEVICE_ID);
     
     // Process pending ASA profile switch
-    if (pendingAsaProfile >= 0 && (millis() - asaResponseSentTime > ASA_SWITCH_DELAY)) {
-        Serial.printf("⚡ Switching to ASA profile %d now...\n", pendingAsaProfile);
-        if (lora->applyProfileFromSettings(pendingAsaProfile)) {
-            Serial.println("✓ ASA profile applied successfully");
-            Serial.println(lora->getCurrentProfileInfo());
-        } else {
-            Serial.println("✗ Failed to apply ASA profile");
-        }
-        pendingAsaProfile = -1; // Clear pending state
-    }
+    lora->processAsaProfileSwitch();
     
     // Process boat mode (adaptive power management)
     processBoatMode();
@@ -525,7 +469,7 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count, false); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count); // No ACK for heartbeat
             lastHeartbeatTime = millis();
             
 #ifdef ROLE_SLAVE
@@ -533,7 +477,7 @@ void loop() {
 #endif
         } else {
 #ifdef ROLE_SLAVE
-            Serial.printf("[HB] Skipping heartbeat - previous one still pending (ID: %u)\n", lastHeartbeatPacketId);
+            Serial.printf("[HB] Skipping heartbeat - previous one still pending (ID: %u)\r\n", lastHeartbeatPacketId);
 #endif
         }
     }
@@ -541,14 +485,14 @@ void loop() {
     // Periodic statistics
     if (millis() - lastStatsTime > 300000) { // Every 5 minutes
         lastStatsTime = millis();
-        Serial.printf("[INFO] Uptime: %lu min, TX: %lu, RX: %lu, Heap: %d bytes\n",
+        Serial.printf("[INFO] Uptime: %lu min, TX: %lu, RX: %lu, Heap: %d bytes\r\n",
                      millis() / 60000, packetsSent, packetsReceived, ESP.getFreeHeap());
         if (boatMode) {
             unsigned long idleTime = millis() - lastActivityTime;
-            Serial.printf("[BOAT] Mode: %s, Idle: %lu s\n", 
+            Serial.printf("[BOAT] Mode: %s, Idle: %lu s\r\n", 
                          boatMode ? "ACTIVE" : "OFF", idleTime / 1000);
         }
     }
     
-    delay(10);
+    delay(1);
 }

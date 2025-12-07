@@ -19,6 +19,10 @@ public:
     PacketAck() : ackedId(0) {
         packetType = CMD_ACK;
         payloadLen = sizeof(ackedId);
+        // --- FLAGS ---
+        ackRequired = false;     // ACK не должен требовать ACK
+        highPriority = true;     // ACK должен лететь немедленно
+        service = true;          // служебный пакет
     }
 };
 

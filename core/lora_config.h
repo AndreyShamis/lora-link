@@ -8,6 +8,8 @@
 typedef uint8_t PacketId_t;
 typedef uint8_t LoraAddress_t;
 
+static constexpr size_t MAX_LORA_PAYLOAD = 85;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PROFILE CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════

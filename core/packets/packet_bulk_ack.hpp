@@ -21,6 +21,9 @@ public:
     PacketBulkAck() : count(0) {
         packetType = CMD_BULK_ACK;
         payloadLen = sizeof(count);
+        ackRequired = false;     // ACK не должен требовать ACK
+        highPriority = true;     // ACK должен лететь немедленно
+        service = true;          // служебный пакет
         for(int i = 0; i < 10; i++) ackedIds[i] = 0;
     }
     

@@ -21,21 +21,24 @@ enum CommandID : uint8_t
 // ═══════════════════════════════════════════════════════════════════════════
 enum CommandType : uint8_t
 {
-    CMD_ACK = 'A',
-    CMD_BULK_ACK = 'B',
-    CMD_COMMAND_STRING = 'C',
-    CMD_CONFIG = 'F',
-    CMD_INFO_ENGINE = 'I',
-    CMD_NAV = 'N',
-    CMD_PING = 'P',
-    CMD_HEARTBEAT = 'H',
-    CMD_PONG = 'Q',
-    CMD_RSSI_REPORT = 'R',
-    CMD_STATUS = 'S',
-    CMD_TELEMETRY_FRAGMENT = 'T',
-    CMD_REQUEST_INFO = 'i',
-    CMD_COMMAND_RESPONSE = 'r',
-    CMD_REQUEST_ASA = 'a',
-    CMD_REPOSNCE_ASA = 'b',
-    CMD_AGR = 'G',  // Aggregated packet
+    CMD_ACK                 = 33,       // ACK  'A'
+    CMD_BULK_ACK            = 34,       // Bulk ACK  'B'
+    CMD_HEARTBEAT           = 39,       // 'H'
+    CMD_REQUEST_ASA         = 40,       // 'a'
+    CMD_RESPONCE_ASA        = 41,       // 'b'
+    CMD_COMMAND_STRING      = 42,       // 'C' Command packet
+    CMD_AGR                 = 43,       // Aggregated packet
+
+    CMD_PONG                = 60,       // 'O'
+    CMD_PING                = 62,       // 'P'
+
+    CMD_CONFIG              = 'F',      // Config packet
+    CMD_INFO_ENGINE         = 'I',      // Engine info packet
+    CMD_NAV                 = 'N',      // Navigation packet
+    CMD_RSSI_REPORT         = 'R',      // RSSI report packet
+    CMD_STATUS              = 'S',      // Status packet
+    CMD_TELEMETRY_FRAGMENT  = 'T',      // Telemetry fragment packet
+    CMD_REQUEST_INFO        = 'i',      // Request info packet
+    CMD_COMMAND_RESPONSE    = 'r',      // Command response packet
+
 };

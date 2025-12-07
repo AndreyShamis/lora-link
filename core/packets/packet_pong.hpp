@@ -15,6 +15,9 @@ public:
     PacketPong() {
         packetType = CMD_PONG;
         payloadLen = 0; // PONG contains no data
+        ackRequired = false;     // ACK не должен требовать ACK
+        highPriority = false;     // ACK должен лететь немедленно
+        service = false;          // служебный пакет
     }
 };
 

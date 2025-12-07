@@ -28,6 +28,9 @@ struct PacketAsaExchange : public PacketBase {
         packetId = 0;
         payloadLen = sizeof(profileIndex);
         profileIndex = 0;
+        ackRequired = false;     // ACK не должен требовать ACK
+        highPriority = true;     // ACK должен лететь немедленно
+        service = true;          // служебный пакет
     }
 
     void setProfile(uint8_t index) {
