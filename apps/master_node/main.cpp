@@ -308,16 +308,15 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         Serial.println("║ COMMUNICATION                              ║");
         Serial.println("║  ping              Send PING to slave      ║");
         Serial.println("║  send <text>       Send text message       ║");
-        Serial.println("║  request status    Request slave status    ║");
         Serial.println("║  request info      Request slave info      ║");
         Serial.println("║  asa <0-12>        ASA profile request     ║");
         Serial.println("║                                            ║");
         Serial.println("║ CONFIGURATION                              ║");
         Serial.println("║  profile <0-12>    Switch to profile       ║");
         Serial.println("║  profiles          List all profiles       ║");
-        Serial.println("║  lora              Force LoRa mode         ║");
-        Serial.println("║  fsk               Force FSK mode          ║");
-        Serial.println("║  auto              Auto mode selection     ║");
+        Serial.println("║  !lora              Force LoRa mode         ║");
+        Serial.println("║  !fsk               Force FSK mode          ║");
+        Serial.println("║  !auto              Auto mode selection     ║");
         Serial.println("║                                            ║");
         Serial.println("║ MONITORING                                 ║");
         Serial.println("║  stats             Show statistics         ║");
@@ -368,16 +367,6 @@ void processIncomingPackets() {
             String msg = String((char*)pkt.payload, pkt.payloadLen);
             log("Message: " + msg);
         }
-        
-        // Handle ASA response - DON'T apply yet, wait for ACK to be sent first
-        else if (pkt.packetType == CMD_RESPONCE_ASA) {
-            lora->handleAsaResponse(&pkt);
-        }
-        // Handle ASA request - respond with ASA response (DON'T switch yet!)
-        else if (pkt.packetType == CMD_REQUEST_ASA) {
-            lora->handleAsaRequest(&pkt);
-        }
-
     }
 }
 
@@ -421,7 +410,7 @@ void loop() {
     lora->processBulkAckTimeout(TARGET_DEVICE_ID);
     
     // Process pending ASA profile switch
-    lora->processAsaProfileSwitch();
+    //lora->processAsaProfileSwitch();
     
     // Auto heartbeat
     if (autoHeartbeat && (millis() - lastHeartbeatTime > heartbeatInterval)) {

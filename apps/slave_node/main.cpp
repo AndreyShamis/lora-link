@@ -369,17 +369,6 @@ void processIncomingPackets() {
             lora->sendPacketBase(pkt.getSenderId(), echoPkt, (const uint8_t*)echo.c_str());
             packetsSent++;
         }
-        
-        // Handle ASA request - respond with ASA response (DON'T switch yet!)
-        else if (pkt.packetType == CMD_REQUEST_ASA) {
-            lora->handleAsaRequest(pkt, packetsSent);
-        }
-        
-        // Handle ASA response - schedule profile switch
-        else if (pkt.packetType == CMD_RESPONCE_ASA) {
-            lora->handleAsaResponse(pkt);
-        }
-        
     }
 }
 

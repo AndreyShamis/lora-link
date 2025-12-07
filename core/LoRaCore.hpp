@@ -66,6 +66,7 @@ private:
 
     std::vector<PendingSend> pending;
     SemaphoreHandle_t pendingMutex = nullptr;                                // Мьютекс для pending vector
+    SemaphoreHandle_t asaMutex = nullptr;                                    // Мьютекс для ASA переменных
     std::function<void(PacketId_t, LoraAddress_t, uint8_t)> ackCallback = nullptr; // callback(packetId, senderId, packetType)
     std::vector<String> logBuffer;
     SemaphoreHandle_t logMutex = nullptr;
@@ -108,6 +109,8 @@ private:
     int _ack_received = 0;
     int _last_rssi = -200;
     int _last_snr = -200;
+
+    void processAsaProfileSwitchTask();
 public:
     int getRxErrorCount() const { return _rx_errors; }
     int getDuplicatedAcksCount() const { return _duplicated_acks; }
@@ -361,7 +364,7 @@ private:
     static void receiveTaskWrapper(void *param);
     static void sendTaskWrapper(void *param);
     static void resendTaskWrapper(void *param);
-
+    static void processAsaProfileSwitchWrapper(void *param);
 
     void updateRetryParameters();
     bool applyLoRa(const LoRaProfile &p);

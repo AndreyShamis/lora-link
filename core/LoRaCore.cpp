@@ -39,6 +39,10 @@ void LoRaCore::resendTaskWrapper(void *param)
     static_cast<LoRaCore *>(param)->resendTask();
 }
 
+void LoRaCore::processAsaProfileSwitchWrapper(void *param)
+{
+    static_cast<LoRaCore *>(param)->processAsaProfileSwitchTask();
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -74,9 +78,10 @@ bool LoRaCore::begin()
     outgoingQueue = xQueueCreate(LORA_OUTGOING_QUEUE_SIZE, sizeof(LoRaPacket));
     radioSemaphore = xSemaphoreCreateBinary();
     pendingMutex = xSemaphoreCreateMutex();
+    asaMutex = xSemaphoreCreateMutex();
     logMutex = xSemaphoreCreateMutex();
 
-    if (!incomingQueue || !outgoingQueue || !radioSemaphore || !pendingMutex || !logMutex)
+    if (!incomingQueue || !outgoingQueue || !radioSemaphore || !pendingMutex || !asaMutex || !logMutex)
     {
         LLog("LoRaCore: Failed to create FreeRTOS objects");
         return false;
@@ -87,10 +92,12 @@ bool LoRaCore::begin()
     // Create tasks
     BaseType_t res1 = xTaskCreatePinnedToCore(receiveTaskWrapper, "LoRaRecv", 6144, this, 3, &receiverTaskHandle, 1);
     BaseType_t res2 = xTaskCreatePinnedToCore(sendTaskWrapper, "LoRaSend", 6144, this, 2, &senderTaskHandle, 1);
+    
     BaseType_t res3 = xTaskCreatePinnedToCore(resendTaskWrapper, "LoRaRetry", 4096, this, 1, nullptr, 0);
     BaseType_t res4 = xTaskCreatePinnedToCore(logTaskWrapper, "LoRaLog", 3072, this, 1, nullptr, 0);
+    BaseType_t res5 = xTaskCreatePinnedToCore(processAsaProfileSwitchWrapper, "LoRaASA", 4096, this, 1, nullptr, 0);
 
-    if (res1 != pdPASS || res2 != pdPASS || res3 != pdPASS || res4 != pdPASS)
+    if (res1 != pdPASS || res2 != pdPASS || res3 != pdPASS || res4 != pdPASS || res5 != pdPASS)
     {
         LLog("LoRaCore: Failed to create tasks");
         return false;
@@ -780,6 +787,10 @@ void LoRaCore::receiveTask()
                 putToLogBuffer(fullLog);
                 if (pkt.packetType == CMD_ACK && !pkt.isAckRequired()) { handleAck(pkt); } 
                 else if(pkt.packetType == CMD_BULK_ACK && !pkt.isAckRequired()) { handleBulkAck(pkt); }
+                        // Handle ASA response - DON'T apply yet, wait for ACK to be sent first
+                else if (pkt.packetType == CMD_RESPONCE_ASA) { handleAsaResponse(&pkt); }
+                // Handle ASA request - respond with ASA response (DON'T switch yet!)
+                else if (pkt.packetType == CMD_REQUEST_ASA) { handleAsaRequest(&pkt); }
                 else {
                     if (pkt.isAckRequired()) {
                         addAckToBulk(pkt.packetId, pkt.getSenderId());
@@ -1145,11 +1156,17 @@ bool LoRaCore::handleAsaRequest(const LoRaPacket *pkt) {
         LLog("[ASA]Sending ASA response for profile " + String(requestedProfile) + " (staying on current profile for now)...");
         sendAsaResponse(requestedProfile, pkt->getSenderId());
         
-        // Schedule profile switch after delay
-        pendingAsaProfile = requestedProfile;
-        asaResponseSentTime = millis();
-        LLog("[ASA]⏳ Will switch to profile " + String(requestedProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
-        return true;
+        // Schedule profile switch after delay (with mutex protection)
+        if (asaMutex && xSemaphoreTake(asaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            pendingAsaProfile = requestedProfile;
+            asaResponseSentTime = millis();
+            xSemaphoreGive(asaMutex);
+            LLog("[ASA]⏳ Will switch to profile " + String(requestedProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+            return true;
+        } else {
+            LLog("[ASA]✗ Failed to acquire asaMutex");
+            return false;
+        }
     } else {
         LLog("[ASA]✗ Invalid profile index: " + String(requestedProfile) + " (max: " + String(LORA_PROFILE_COUNT-1) + ")");
         return false;
@@ -1165,29 +1182,64 @@ bool LoRaCore::handleAsaResponse(const LoRaPacket* pkt) {
     uint8_t responseProfile = pkt->payload[0];
     LLog("[ASA]response received: profile " + String(responseProfile) + " from device " + String(pkt->getSenderId()));
     
-    // Schedule profile switch after delay (to allow ACK to be sent)
-    pendingAsaProfile = responseProfile;
-    asaResponseReceivedTime = millis();
-    LLog("[ASA]⏳ Will switch to profile " + String(responseProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
-    
-    return true;
+    // Schedule profile switch after delay (to allow ACK to be sent) - with mutex protection
+    if (asaMutex && xSemaphoreTake(asaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        pendingAsaProfile = responseProfile;
+        asaResponseReceivedTime = millis();
+        xSemaphoreGive(asaMutex);
+        LLog("[ASA]⏳ Will switch to profile " + String(responseProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+        return true;
+    } else {
+        LLog("[ASA]✗ Failed to acquire asaMutex");
+        return false;
+    }
 }
 
 // -----------------------------------------------------------------------------
 bool LoRaCore::processAsaProfileSwitch() {
-    if (pendingAsaProfile < 0) {
-        return false; // No pending profile switch
+    if (!asaMutex) {
+        return false;
     }
     
-    // Check if enough time has passed (using the most recent timestamp)
-    unsigned long lastAsaTime = max(asaResponseSentTime, asaResponseReceivedTime);
-    if (millis() - lastAsaTime <= ASA_SWITCH_DELAY) {
-        return false; // Not ready yet
+    // Check and read state atomically
+    int profileToApply = -1;
+    unsigned long currentTime = millis();
+    unsigned long lastAsaTime = 0;
+    
+    if (xSemaphoreTake(asaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (pendingAsaProfile < 0) {
+            xSemaphoreGive(asaMutex);
+            return false; // No pending profile switch
+        }
+        
+        // Validate profile index
+        if (pendingAsaProfile >= LORA_PROFILE_COUNT) {
+            LLog("[ASA]✗ Invalid pending profile index: " + String(pendingAsaProfile) + " (max: " + String(LORA_PROFILE_COUNT-1) + ")");
+            pendingAsaProfile = -1; // Clear invalid state
+            xSemaphoreGive(asaMutex);
+            return false;
+        }
+        
+        // Check if enough time has passed
+        lastAsaTime = max(asaResponseSentTime, asaResponseReceivedTime);
+        if (currentTime - lastAsaTime <= ASA_SWITCH_DELAY) {
+            xSemaphoreGive(asaMutex);
+            return false; // Not ready yet
+        }
+        
+        // Ready to switch - save profile and clear state
+        profileToApply = pendingAsaProfile;
+        pendingAsaProfile = -1;
+        asaResponseSentTime = 0;
+        asaResponseReceivedTime = 0;
+        xSemaphoreGive(asaMutex);
+    } else {
+        return false; // Could not acquire mutex
     }
     
-    // Time to switch!
-    LLog("[ASA]⚡ Switching to ASA profile " + String(pendingAsaProfile) + " now...");
-    bool success = applyProfileFromSettings(pendingAsaProfile);
+    // Apply profile switch outside of critical section
+    LLog("[ASA]⚡ Switching to ASA profile " + String(profileToApply) + " now...");
+    bool success = applyProfileFromSettings(profileToApply);
     
     if (success) {
         LLog("[ASA]✓ ASA profile applied successfully");
@@ -1196,9 +1248,12 @@ bool LoRaCore::processAsaProfileSwitch() {
         LLog("[ASA]✗ Failed to apply ASA profile");
     }
     
-    pendingAsaProfile = -1; // Clear pending state
-    asaResponseSentTime = 0;
-    asaResponseReceivedTime = 0;
-    
     return success;
+}
+
+void LoRaCore::processAsaProfileSwitchTask() {
+    while (true){
+        vTaskDelay(pdMS_TO_TICKS(200));
+        processAsaProfileSwitch();
+    }
 }
