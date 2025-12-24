@@ -6,6 +6,7 @@
 
 #include <SPI.h>
 #include <vector>
+#include <map>
 #include <functional>
 #include "lora_config.h"
 #include "lora_helpers.hpp"
@@ -51,6 +52,7 @@ class LoRaCore
 private:
     static TaskHandle_t receiverTaskHandle;
     static TaskHandle_t senderTaskHandle;
+    static TaskHandle_t asaTaskHandle;
     LoraAddress_t srcAddress;     // Current source address (can be changed)
     LoraAddress_t dstAddress;     // Default destination address (can be changed)
     Module *_module;
@@ -110,7 +112,12 @@ private:
     int _last_rssi = -200;
     int _last_snr = -200;
 
+    // Хранилище информации о клиентах/узлах
+    std::map<LoraAddress_t, ClientInfo> clients;
+    SemaphoreHandle_t clientsMutex = nullptr;
+
     void processAsaProfileSwitchTask();
+    bool hasPendingAsa();
 public:
     int getRxErrorCount() const { return _rx_errors; }
     int getDuplicatedAcksCount() const { return _duplicated_acks; }
@@ -118,6 +125,83 @@ public:
     int getTxErrorCount() const { return _tx_errors; }
     int getLastRssi() const { return _last_rssi; }
     int getLastSnr() const { return _last_snr; }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLIENT INFO MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Обновить информацию о клиенте при получении пакета от него
+    void updateClientOnReceive(LoraAddress_t address, float rssi, float snr) {
+        if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            auto it = clients.find(address);
+            if (it == clients.end()) {
+                // Создаем новую запись о клиенте
+                clients[address] = ClientInfo(address);
+                it = clients.find(address);
+            }
+            it->second.updateOnReceive(rssi, snr);
+            xSemaphoreGive(clientsMutex);
+        }
+    }
+    
+    // Обновить информацию о клиенте при отправке пакета ему
+    void updateClientOnSend(LoraAddress_t address) {
+        if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            auto it = clients.find(address);
+            if (it == clients.end()) {
+                clients[address] = ClientInfo(address);
+                it = clients.find(address);
+            }
+            it->second.updateOnSend();
+            xSemaphoreGive(clientsMutex);
+        }
+    }
+    
+    // Получить информацию о клиенте (потокобезопасно)
+    bool getClientInfo(LoraAddress_t address, ClientInfo &info) {
+        bool found = false;
+        if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            auto it = clients.find(address);
+            if (it != clients.end()) {
+                info = it->second;
+                found = true;
+            }
+            xSemaphoreGive(clientsMutex);
+        }
+        return found;
+    }
+    
+    // Получить количество известных клиентов
+    size_t getClientsCount() const {
+        return clients.size();
+    }
+    
+    // Получить список всех клиентов (копию для безопасности)
+    std::vector<ClientInfo> getAllClients() {
+        std::vector<ClientInfo> result;
+        if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            for (const auto &pair : clients) {
+                result.push_back(pair.second);
+            }
+            xSemaphoreGive(clientsMutex);
+        }
+        return result;
+    }
+    
+    // Очистить неактивных клиентов (не видели дольше timeoutMs)
+    void cleanupInactiveClients(unsigned long timeoutMs = 60000) {
+        if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            auto it = clients.begin();
+            while (it != clients.end()) {
+                if (!it->second.isActive(timeoutMs)) {
+                    it = clients.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            xSemaphoreGive(clientsMutex);
+        }
+    }
 
     void putToLogBuffer(const String &msg);
     bool applyProfileFromSettings(uint8_t profileIndex);
@@ -132,7 +216,7 @@ public:
     RadioMode mode() const { return _mode;}
     SX1262 &getRadio() { return radio;}
     bool removePendingPacket(PacketId_t );  // Метод для принудительного удаления пакета из pending списка (например, при успешном ASA ответе)
-    PacketId_t sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload);
+    PacketId_t sendPacketBase(LoraAddress_t receiverId, PacketBase *base, const uint8_t *payload);
     PacketId_t sendAsaResponse(uint8_t profileIndex, LoraAddress_t receiver);
     PacketId_t sendAsaRequest(uint8_t profileIndex, LoraAddress_t receiver);
     
@@ -165,6 +249,9 @@ public:
         }
         if (logMutex){
             vSemaphoreDelete(logMutex);
+        }
+        if (clientsMutex){
+            vSemaphoreDelete(clientsMutex);
         }
         radio.clearDio1Action();
         delete _module;
@@ -353,8 +440,8 @@ public:
     }
     
     // Send with default destination
-    PacketId_t sendPacket(PacketBase &base, const uint8_t *payload, bool waitForAck = true) {
-        base.ackRequired = waitForAck;
+    PacketId_t sendPacket(PacketBase *base, const uint8_t *payload, bool waitForAck = true) {
+        base->ackRequired = waitForAck;
         return sendPacketBase(dstAddress, base, payload);
     }
 
@@ -367,12 +454,12 @@ private:
     static void processAsaProfileSwitchWrapper(void *param);
 
     void updateRetryParameters();
-    bool applyLoRa(const LoRaProfile &p);
-    bool applyFSK(const FSKProfile &p);
+    bool applyLoRa(const LoRaProfile *p);
+    bool applyFSK(const FSKProfile *p);
     bool switchTo(RadioMode m);
     // ACK handling methods
-    void handleAck(const LoRaPacket &pkt);
-    void handleBulkAck(const LoRaPacket &pkt);
+    void handleAck(const LoRaPacket *pkt);
+    void handleBulkAck(const LoRaPacket *pkt);
     void handleSingleAck(PacketId_t ackedId, LoraAddress_t senderId, uint8_t packetType);
     
     // Bulk ACK methods
@@ -381,7 +468,7 @@ private:
     void checkBulkAckTimeout(uint8_t targetDeviceId);
 
     // Packet packing
-    void packBaseIntoLoRa(LoRaPacket &out, LoraAddress_t senderId, LoraAddress_t receiverId, const PacketBase &base, const uint8_t *payload);
+    void packBaseIntoLoRa(LoRaPacket *out, LoraAddress_t senderId, LoraAddress_t receiverId, const PacketBase *base, const uint8_t *payload);
     
     // Task implementations
     void logTask();
@@ -390,21 +477,21 @@ private:
     void resendTask();
     int transmitPacket(const LoRaPacket *txPkt, const size_t len);
 
-    static PacketBase PacketBaseFromLoRa(const LoRaPacket &pkt)
+    static PacketBase PacketBaseFromLoRa(const LoRaPacket *pkt)
     {
         PacketBase b;
-        b.packetType = pkt.packetType;
-        b.packetId   = pkt.packetId;
-        b.payloadLen = pkt.payloadLen;
+        b.packetType = pkt->packetType;
+        b.packetId   = pkt->packetId;
+        b.payloadLen = pkt->payloadLen;
 
-        b.ackRequired       = pkt.isAckRequired();
-        b.highPriority      = pkt.isHighPriority();
-        b.service           = pkt.isService();
-        b.noRetry           = pkt.isNoRetry();
-        b.encrypted         = pkt.isEncrypted();
-        b.compressed        = pkt.isCompressed();
-        b.aggregated        = pkt.isAggregatedFrame();
-        b.internalLocalOnly = pkt.isInternalLocalOnly();
+        b.ackRequired       = pkt->isAckRequired();
+        b.highPriority      = pkt->isHighPriority();
+        b.service           = pkt->isService();
+        b.noRetry           = pkt->isNoRetry();
+        b.encrypted         = pkt->isEncrypted();
+        b.compressed        = pkt->isCompressed();
+        b.aggregated        = pkt->isAggregatedFrame();
+        b.internalLocalOnly = pkt->isInternalLocalOnly();
         
         return b;
     }

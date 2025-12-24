@@ -45,7 +45,7 @@ void processSerialCommands() {
         Serial.println("Sending PING...");
         PacketPing ping;
         uint8_t dummy = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy);
+        lora->sendPacketBase(TARGET_DEVICE_ID, &ping, &dummy);
         packetsSent++;
         lastPingTime = millis();
         lastActivityTime = millis();
@@ -57,7 +57,7 @@ void processSerialCommands() {
         PacketCommand pkt;
         pkt.payloadLen = min((int)msg.length(), (int)MAX_LORA_PAYLOAD);
         
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str());
+        lora->sendPacketBase(TARGET_DEVICE_ID, &pkt, (const uint8_t*)msg.c_str());
         packetsSent++;
         lastActivityTime = millis();
         
@@ -245,7 +245,7 @@ void processSerialCommands() {
         PacketRequestInfo pkt;
         pkt.packetType = CMD_REQUEST_INFO;
         pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr);
+        lora->sendPacketBase(TARGET_DEVICE_ID, &pkt, nullptr);
         packetsSent++;
         lastActivityTime = millis();
         
@@ -346,7 +346,7 @@ void processIncomingPackets() {
             Serial.println("PING received, sending PONG...");
             PacketPong pong;
             uint8_t dummy = 0;
-            lora->sendPacketBase(pkt.getSenderId(), pong, &dummy);
+            lora->sendPacketBase(pkt.getSenderId(), &pong, &dummy);
             packetsSent++;
         }
         
@@ -366,7 +366,7 @@ void processIncomingPackets() {
             PacketBase echoPkt;
             echoPkt.packetType = CMD_COMMAND_STRING;
             echoPkt.payloadLen = min((int)echo.length(), (int)MAX_LORA_PAYLOAD);
-            lora->sendPacketBase(pkt.getSenderId(), echoPkt, (const uint8_t*)echo.c_str());
+            lora->sendPacketBase(pkt.getSenderId(), &echoPkt, (const uint8_t*)echo.c_str());
             packetsSent++;
         }
     }
@@ -458,7 +458,7 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, &hb, (uint8_t*)&hb.count); // No ACK for heartbeat
             lastHeartbeatTime = millis();
             
 #ifdef ROLE_SLAVE

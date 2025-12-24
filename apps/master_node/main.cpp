@@ -106,7 +106,7 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         log("Sending PING...");
         PacketPing ping;
         uint8_t dummy = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, ping, &dummy);
+        lora->sendPacketBase(TARGET_DEVICE_ID, &ping, &dummy);
         packetsSent++;
         lastPingTime = millis();
         
@@ -117,7 +117,7 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         PacketCommand pkt;
         pkt.payloadLen = min((int)msg.length(), (int)MAX_LORA_PAYLOAD);
         
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, (const uint8_t*)msg.c_str());
+        lora->sendPacketBase(TARGET_DEVICE_ID, &pkt, (const uint8_t*)msg.c_str());
         packetsSent++;
         
     } else if (cmd_lower.startsWith("profile ") || cmd_lower.startsWith("prof ")) {
@@ -266,11 +266,62 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         logf("Log entries: %d", lora->getLogBufferSize());
         log("==================\n");
         
+    } else if (cmd_lower == "clients") {
+        log("\n=== Connected Clients ===");
+        logf("Total clients: %d", lora->getClientsCount());
+        
+        auto clients = lora->getAllClients();
+        if (clients.empty()) {
+            log("No clients found.");
+        } else {
+            log("\nAddr | LastSeen  | RX | TX | RSSI(flt) | SNR   | Raw RSSI | Status");
+            log("-----|-----------|----|----|-----------|-------|----------|--------");
+            for (const auto& client : clients) {
+                char buf[120];
+                
+                if (!client.hasReceivedPackets) {
+                    // Клиент никогда не отправлял нам пакеты - только TX
+                    snprintf(buf, sizeof(buf), " %3u |   Never   | %4u | %4u |    N/A    |  N/A  |   N/A    | TX only",
+                        client.address,
+                        client.packetsReceived,
+                        client.packetsSent);
+                } else {
+                    // Нормальная статистика с RSSI/SNR
+                    unsigned long timeSince = client.getTimeSinceLastSeen();
+                    char timeStr[12];
+                    
+                    if (timeSince > 3600000) {
+                        snprintf(timeStr, sizeof(timeStr), "%luh", timeSince / 3600000);
+                    } else if (timeSince > 60000) {
+                        snprintf(timeStr, sizeof(timeStr), "%lumin", timeSince / 60000);
+                    } else if (timeSince > 1000) {
+                        snprintf(timeStr, sizeof(timeStr), "%lus", timeSince / 1000);
+                    } else {
+                        snprintf(timeStr, sizeof(timeStr), "%lums", timeSince);
+                    }
+                    
+                    const char* status = client.isActive(30000) ? "Active" : "Idle";
+                    
+                    snprintf(buf, sizeof(buf), " %3u | %9s | %4u | %4u | %6.1f | %5.1f | %7.1f | %s",
+                        client.address,
+                        timeStr,
+                        client.packetsReceived,
+                        client.packetsSent,
+                        client.getFilteredRssi(),
+                        client.lastSnr,
+                        client.lastRawRssi,
+                        status);
+                }
+                log(buf);
+            }
+        }
+        log("======================================================================\n");
+        
     } else if (cmd_lower == "request info") {
         log("Requesting info from slave...");
         PacketRequestInfo pkt;
         pkt.payloadLen = 0;
-        lora->sendPacketBase(TARGET_DEVICE_ID, pkt, nullptr);
+        lora->sendPacketBase(TARGET_DEVICE_ID, &pkt, nullptr);
         packetsSent++;
         
     } else if (cmd_lower.startsWith("asa ")) {
@@ -323,6 +374,7 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         Serial.println("║  status            Show system status      ║");
         Serial.println("║  rssi              Show RSSI/SNR/freq      ║");
         Serial.println("║  queue             Show queue status       ║");
+        Serial.println("║  clients           Show client info        ║");
         Serial.println("║  log               Show log buffer info    ║");
         Serial.println("║  info              Show device info        ║");
         Serial.println("║                                            ║");
@@ -424,7 +476,7 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, hb, (uint8_t*)&hb.count); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, &hb, (uint8_t*)&hb.count); // No ACK for heartbeat
             lastHeartbeatTime = millis();
             logf("[HB] Heartbeat sent #%lu", hb.count);
         } else {

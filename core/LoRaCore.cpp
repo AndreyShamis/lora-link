@@ -3,6 +3,7 @@
 // Static member definitions
 TaskHandle_t LoRaCore::receiverTaskHandle = nullptr;
 TaskHandle_t LoRaCore::senderTaskHandle = nullptr;
+TaskHandle_t LoRaCore::asaTaskHandle = nullptr;
 
 // Helper logging functions (global, not class methods)
 void LLog(const char *s)
@@ -64,7 +65,7 @@ bool LoRaCore::begin()
     pinMode(LORA_BUSY, INPUT);
     LLog("LoRaCore: BUSY state before init: " + String(digitalRead(LORA_BUSY)));
 
-    if (!applyLoRa(_loraLong))
+    if (!applyLoRa(&_loraLong))
     {
         LLog("LoRaCore: Failed to apply LoRa settings");
         return false;
@@ -80,8 +81,9 @@ bool LoRaCore::begin()
     pendingMutex = xSemaphoreCreateMutex();
     asaMutex = xSemaphoreCreateMutex();
     logMutex = xSemaphoreCreateMutex();
+    clientsMutex = xSemaphoreCreateMutex();
 
-    if (!incomingQueue || !outgoingQueue || !radioSemaphore || !pendingMutex || !asaMutex || !logMutex)
+    if (!incomingQueue || !outgoingQueue || !radioSemaphore || !pendingMutex || !asaMutex || !logMutex || !clientsMutex)
     {
         LLog("LoRaCore: Failed to create FreeRTOS objects");
         return false;
@@ -95,7 +97,7 @@ bool LoRaCore::begin()
     
     BaseType_t res3 = xTaskCreatePinnedToCore(resendTaskWrapper, "LoRaRetry", 4096, this, 1, nullptr, 0);
     BaseType_t res4 = xTaskCreatePinnedToCore(logTaskWrapper, "LoRaLog", 3072, this, 1, nullptr, 0);
-    BaseType_t res5 = xTaskCreatePinnedToCore(processAsaProfileSwitchWrapper, "LoRaASA", 4096, this, 1, nullptr, 0);
+    BaseType_t res5 = xTaskCreatePinnedToCore(processAsaProfileSwitchWrapper, "LoRaASA", 4096, this, 1, &asaTaskHandle, 0);
 
     if (res1 != pdPASS || res2 != pdPASS || res3 != pdPASS || res4 != pdPASS || res5 != pdPASS)
     {
@@ -167,16 +169,16 @@ int LoRaCore::transmitPacket(const LoRaPacket *txPkt, const size_t len)
     return result;
 }
 
-PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, const uint8_t *payload)
+PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase *base, const uint8_t *payload)
 {
     if (!outgoingQueue) {
         char s2[100];
-        snprintf(s2, sizeof(s2), "⚠️ outgoingQueue is null! Cannot send packet id=%u, type=%c", base.packetId, base.packetType);
+        snprintf(s2, sizeof(s2), "⚠️ outgoingQueue is null! Cannot send packet id=%u, type=%c", base->packetId, base->packetType);
         putToLogBuffer(String(s2));
         return 0;
     }
     
-    base.packetId = ++nextPacketId;
+    base->packetId = ++nextPacketId;
     
     // === AUTOMATIC AGGREGATION LOGIC ===
     // Try to aggregate if:
@@ -184,9 +186,9 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
     // 2. Not ACK/BULK_ACK (they need immediate delivery)
     // 3. Queue has packets waiting
     // 4. Payload is small enough (leaving room for headers)
-    bool canAggregate = base.highPriority == false && 
-                        base.ackRequired == false &&
-                        base.payloadLen <= 30 &&
+    bool canAggregate = base->highPriority == false && 
+                        base->ackRequired == false &&
+                        base->payloadLen <= 30 &&
                         uxQueueMessagesWaiting(outgoingQueue) > 0;
     
     if (canAggregate) {
@@ -205,7 +207,7 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                     if (searchPkt.packetType == CMD_AGR) {
                         // Found existing aggregated packet!
                         PacketAggregated agr;
-                        if (agr.canFit(base.payloadLen)) {
+                        if (agr.canFit(base->payloadLen)) {
                             foundAggregated = true;
                             foundPkt = searchPkt;
                             break;
@@ -269,9 +271,9 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                     
                     // Add new packet
                     if (count < PacketAggregated::MAX_SUB_PACKETS) {
-                        types[count] = base.packetType;
+                        types[count] = base->packetType;
                         payloads[count] = payload;
-                        lens[count] = base.payloadLen;
+                        lens[count] = base->payloadLen;
                         count++;
                         
                         // Serialize new AGR
@@ -285,12 +287,12 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                             newAgr.packetId = foundPkt.packetId; // Keep original ID
                             
                             LoRaPacket agrFrame = {};
-                            packBaseIntoLoRa(agrFrame, srcAddress, receiverId, newAgr, agrPayload);
+                            packBaseIntoLoRa(&agrFrame, srcAddress, receiverId, &newAgr, agrPayload);
                             xQueueSendToBack(outgoingQueue, &agrFrame, 20);
                             
                             char s[120];
                             snprintf(s, sizeof(s), "📦➕ Added to AGR: id=%u, type=%c, count=%u→%u, to=%u", 
-                                    base.packetId, base.packetType, count-1, count, receiverId);
+                                    base->packetId, base->packetType, count-1, count, receiverId);
                             putToLogBuffer(String(s));
                             
                             return foundPkt.packetId; // Return AGR's ID
@@ -314,9 +316,9 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
             
             if (removed) {
                 PacketAggregated newAgr;
-                uint8_t types[2] = {foundPkt.packetType, base.packetType};
+                uint8_t types[2] = {foundPkt.packetType, base->packetType};
                 const uint8_t* payloads[2] = {foundPkt.payload, payload};
-                uint8_t lens[2] = {foundPkt.payloadLen, base.payloadLen};
+                uint8_t lens[2] = {foundPkt.payloadLen, base->payloadLen};
                 
                 uint8_t agrPayload[MAX_LORA_PAYLOAD];
                 uint8_t agrLen = newAgr.serialize(agrPayload, MAX_LORA_PAYLOAD, types, payloads, lens, 2);
@@ -326,17 +328,17 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
                     newAgr.packetId = foundPkt.packetId; // Use first packet's ID
                     
                     LoRaPacket agrFrame = {};
-                    packBaseIntoLoRa(agrFrame, srcAddress, receiverId, newAgr, agrPayload);
+                    packBaseIntoLoRa(&agrFrame, srcAddress, receiverId, &newAgr, agrPayload);
                     xQueueSendToFront(outgoingQueue, &agrFrame, pdMS_TO_TICKS(10));
                     
                     char s[150];
                     snprintf(s, sizeof(s), "📦✨ Created AGR: id=%u, types=[%c,%c], lens=[%u,%u], to=%u", 
-                            foundPkt.packetId, foundPkt.packetType, base.packetType, 
-                            foundPkt.payloadLen, base.payloadLen, receiverId);
+                            foundPkt.packetId, foundPkt.packetType, base->packetType, 
+                            foundPkt.payloadLen, base->payloadLen, receiverId);
                     putToLogBuffer(String(s));
                     
                     // Add to pending if waitForAck
-                    if (base.ackRequired && pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (base->ackRequired && pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         PendingSend pendingItem = {};
                         pendingItem.pkt = agrFrame;
                         pendingItem.timestamp = millis();
@@ -353,16 +355,16 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
     
     // === NORMAL SENDING (no aggregation) ===
     LoRaPacket frame = {};
-    packBaseIntoLoRa(frame, srcAddress, receiverId, base, payload);
+    packBaseIntoLoRa(&frame, srcAddress, receiverId, base, payload);
     
     bool ok;
-    if (base.highPriority) {
+    if (base->highPriority) {
         ok = xQueueSendToFront(outgoingQueue, &frame, pdMS_TO_TICKS(100)) == pdTRUE;
     } else {
         ok = xQueueSendToBack(outgoingQueue, &frame, pdMS_TO_TICKS(200)) == pdTRUE;
     }
     
-    if (ok && base.ackRequired) {
+    if (ok && base->ackRequired) {
         if (pendingMutex && xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(2100)) == pdTRUE) {
             auto existingIt = std::find_if(pending.begin(), pending.end(),
                                           [&frame](const PendingSend &p)
@@ -385,56 +387,56 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase &base, 
             xSemaphoreGive(pendingMutex);
         }
     }
-    return base.packetId;
+    return base->packetId;
 }
 
-void LoRaCore::packBaseIntoLoRa(LoRaPacket &out,
+void LoRaCore::packBaseIntoLoRa(LoRaPacket *out,
                                 LoraAddress_t senderId,
                                 LoraAddress_t receiverId,
-                                const PacketBase &base,
+                                const PacketBase *base,
                                 const uint8_t *payload)
 {
-    memset(&out, 0, sizeof(out));
-    out.setSenderId(senderId);
-    out.setReceiverId(receiverId);
-    out.packetType = base.packetType;
-    out.packetId   = base.packetId;
+    memset(out, 0, sizeof(*out));
+    out->setSenderId(senderId);
+    out->setReceiverId(receiverId);
+    out->packetType = base->packetType;
+    out->packetId   = base->packetId;
 
     // --- FLAGS MAPPING ---
-    out.setAckRequired(base.ackRequired);
-    out.setHighPriority(base.highPriority);
-    out.setService(base.service);
-    out.setNoRetry(base.noRetry);
-    out.setEncrypted(base.encrypted);
-    out.setCompressed(base.compressed);
-    out.setAggregatedFrame(base.aggregated);
-    out.setInternalLocalOnly(base.internalLocalOnly);
+    out->setAckRequired(base->ackRequired);
+    out->setHighPriority(base->highPriority);
+    out->setService(base->service);
+    out->setNoRetry(base->noRetry);
+    out->setEncrypted(base->encrypted);
+    out->setCompressed(base->compressed);
+    out->setAggregatedFrame(base->aggregated);
+    out->setInternalLocalOnly(base->internalLocalOnly);
 
     // --- PAYLOAD CHECKS ---
-    if (base.payloadLen > MAX_LORA_PAYLOAD) {
-        out.payloadLen = 0;
+    if (base->payloadLen > MAX_LORA_PAYLOAD) {
+        out->payloadLen = 0;
         char msg[100];
         snprintf(msg, sizeof(msg),
                  "❌ packBase: payloadLen %u exceeds MAX %u",
-                 base.payloadLen, MAX_LORA_PAYLOAD);
+                 base->payloadLen, MAX_LORA_PAYLOAD);
         putToLogBuffer(msg);
         return;
     }
 
-    if (base.payloadLen > 0 && payload == nullptr) {
-        out.payloadLen = 0;
+    if (base->payloadLen > 0 && payload == nullptr) {
+        out->payloadLen = 0;
         char msg[100];
         snprintf(msg, sizeof(msg),
                  "❌ packBase: payload is null, len=%u",
-                 base.payloadLen);
+                 base->payloadLen);
         putToLogBuffer(msg);
         return;
     }
 
-    out.payloadLen = base.payloadLen;
+    out->payloadLen = base->payloadLen;
 
-    if (out.payloadLen > 0) {
-        memcpy(out.payload, payload, out.payloadLen);
+    if (out->payloadLen > 0) {
+        memcpy(out->payload, payload, out->payloadLen);
     }
 
     // String hex = "";
@@ -458,35 +460,35 @@ void LoRaCore::packBaseIntoLoRa(LoRaPacket &out,
 // ACK HANDLING
 // ═══════════════════════════════════════════════════════════════════════════
 
-void LoRaCore::handleAck(const LoRaPacket &pkt)
+void LoRaCore::handleAck(const LoRaPacket *pkt)
 {
-    if (pkt.payloadLen != sizeof(PacketId_t))
+    if (pkt->payloadLen != sizeof(PacketId_t))
     {
         char s[80];
-        snprintf(s, sizeof(s), "❌ Invalid ACK payload len: %u (expected %u)", pkt.payloadLen, sizeof(PacketId_t));
+        snprintf(s, sizeof(s), "❌ Invalid ACK payload len: %u (expected %u)", pkt->payloadLen, sizeof(PacketId_t));
         putToLogBuffer(String(s));
         return;
     }
     PacketId_t ackedId;
-    memcpy(&ackedId, pkt.payload, sizeof(ackedId));
+    memcpy(&ackedId, pkt->payload, sizeof(ackedId));
     char s[80];
-    snprintf(s, sizeof(s), "📩 Single ACK received: id=%u from device %u", ackedId, pkt.getSenderId());
+    snprintf(s, sizeof(s), "📩 Single ACK received: id=%u from device %u", ackedId, pkt->getSenderId());
     putToLogBuffer(String(s));
 
-    handleSingleAck(ackedId, pkt.getSenderId(), pkt.packetType);
+    handleSingleAck(ackedId, pkt->getSenderId(), pkt->packetType);
 }
 
-void LoRaCore::handleBulkAck(const LoRaPacket &pkt)
+void LoRaCore::handleBulkAck(const LoRaPacket *pkt)
 {
-    if (pkt.payloadLen < sizeof(uint8_t))
+    if (pkt->payloadLen < sizeof(uint8_t))
     {
         putToLogBuffer(String("❌ BULK ACK: Invalid payload length"));
         return;
     }
 
-    uint8_t count = pkt.payload[0];
+    uint8_t count = pkt->payload[0];
 
-    if (count > 10 || pkt.payloadLen != sizeof(uint8_t) + (count * sizeof(PacketId_t)))
+    if (count > 10 || pkt->payloadLen != sizeof(uint8_t) + (count * sizeof(PacketId_t)))
     {
         char errorLog[120];
         snprintf(errorLog, sizeof(errorLog), "❌ BULK ACK: Invalid count=%u or length mismatch", count);
@@ -495,7 +497,7 @@ void LoRaCore::handleBulkAck(const LoRaPacket &pkt)
     }
 
     PacketId_t ackedIds[10];
-    memcpy(ackedIds, &pkt.payload[1], count * sizeof(PacketId_t));
+    memcpy(ackedIds, &pkt->payload[1], count * sizeof(PacketId_t));
     PacketId_t uniqueIds[10];
     uint8_t uniqueCount = 0;
 
@@ -528,14 +530,14 @@ void LoRaCore::handleBulkAck(const LoRaPacket &pkt)
 
     char successLog[120];
     if (uniqueCount != count) {
-        snprintf(successLog, sizeof(successLog), "📩 BULK ACK: %u IDs [%s] → %u unique [%s] from device %u (filtered %u duplicates)", count, idList.c_str(), uniqueCount, uniqueIdList.c_str(), pkt.getSenderId(), count - uniqueCount);
+        snprintf(successLog, sizeof(successLog), "📩 BULK ACK: %u IDs [%s] → %u unique [%s] from device %u (filtered %u duplicates)", count, idList.c_str(), uniqueCount, uniqueIdList.c_str(), pkt->getSenderId(), count - uniqueCount);
     } else {
-        snprintf(successLog, sizeof(successLog), "📩 BULK ACK received: %u IDs [%s] from device %u", count, idList.c_str(), pkt.getSenderId());
+        snprintf(successLog, sizeof(successLog), "📩 BULK ACK received: %u IDs [%s] from device %u", count, idList.c_str(), pkt->getSenderId());
     }
     putToLogBuffer(String(successLog));
 
     for (uint8_t i = 0; i < uniqueCount; i++) {
-        handleSingleAck(uniqueIds[i], pkt.getSenderId(), pkt.packetType);
+        handleSingleAck(uniqueIds[i], pkt->getSenderId(), pkt->packetType);
     }
 }
 
@@ -621,7 +623,7 @@ void LoRaCore::sendBulkAck(uint8_t targetDeviceId)
 
     size_t payloadSize = sizeof(uint8_t) + (pendingBulkAck.count * sizeof(PacketId_t));
 
-    sendPacketBase(targetDeviceId, pendingBulkAck, payload);
+    sendPacketBase(targetDeviceId, &pendingBulkAck, payload);
 
     //putToLogBuffer(String("✅ Sent BULK ACK for ") + String(pendingBulkAck.count) + " packets: " + pendingBulkAck.getDebugInfo());
 
@@ -761,6 +763,13 @@ void LoRaCore::receiveTask()
                 
                 int16_t crcState = radio.readData((uint8_t *)&pkt, len);
                 unsigned long t1 = millis();
+                
+                // Получаем RSSI и SNR для статистики
+                float rssi = radio.getRSSI();
+                float snr = radio.getSNR();
+                _last_rssi = (int)rssi;
+                _last_snr = (int)snr;
+                
                 radio.startReceive();
 
                 xSemaphoreGive(radioSemaphore);
@@ -770,6 +779,9 @@ void LoRaCore::receiveTask()
                     _rx_errors++;
                     continue;
                 }
+
+                // Обновляем информацию о клиенте
+                updateClientOnReceive(pkt.getSenderId(), rssi, snr);
 
                 String payloadHex = "";
                 int safePayloadLen = (pkt.payloadLen > MAX_LORA_PAYLOAD) ? 0 : pkt.payloadLen;
@@ -785,8 +797,8 @@ void LoRaCore::receiveTask()
                 snprintf(s, sizeof(s), "[P:%d][RX on %d][L:%d]%lums→[%u->%u], T=[%d], id:%u,  state:%d, %u", pending.size(), getCurrentProfileIndex(), len, t1 - t0, pkt.getSenderId(), pkt.getReceiverId(), pkt.packetType, pkt.packetId,crcState, pkt.payloadLen);
                 fullLog = String(s) + ":[" + payloadHex + "]";
                 putToLogBuffer(fullLog);
-                if (pkt.packetType == CMD_ACK && !pkt.isAckRequired()) { handleAck(pkt); } 
-                else if(pkt.packetType == CMD_BULK_ACK && !pkt.isAckRequired()) { handleBulkAck(pkt); }
+                if (pkt.packetType == CMD_ACK && !pkt.isAckRequired()) { handleAck(&pkt); } 
+                else if(pkt.packetType == CMD_BULK_ACK && !pkt.isAckRequired()) { handleBulkAck(&pkt); }
                         // Handle ASA response - DON'T apply yet, wait for ACK to be sent first
                 else if (pkt.packetType == CMD_RESPONCE_ASA) { handleAsaResponse(&pkt); }
                 // Handle ASA request - respond with ASA response (DON'T switch yet!)
@@ -826,6 +838,11 @@ void LoRaCore::sendTask()
             unsigned long t0 = millis();
             int result = transmitPacket(&txPkt, len);
             unsigned long txDuration = millis() - t0;
+
+            // Обновляем информацию о клиенте при успешной отправке
+            if (result == RADIOLIB_ERR_NONE) {
+                updateClientOnSend(pkt.getReceiverId());
+            }
 
             String payloadHex = "";
             int safePayloadLen = (pkt.payloadLen > MAX_LORA_PAYLOAD) ? 0 : pkt.payloadLen;
@@ -1049,35 +1066,35 @@ String LoRaCore::getCurrentProfileInfo() const {
 }
 
 
-bool LoRaCore::applyLoRa(const LoRaProfile &p) {
+bool LoRaCore::applyLoRa(const LoRaProfile *p) {
     bool success = radio.setModem(RADIOLIB_MODEM_LORA) == RADIOLIB_ERR_NONE &&
                    radio.setFrequency(currentFreq) == RADIOLIB_ERR_NONE &&
-                   radio.setSpreadingFactor(p.sf) == RADIOLIB_ERR_NONE &&
-                   radio.setCodingRate(p.cr) == RADIOLIB_ERR_NONE &&
-                   radio.setBandwidth(p.bw) == RADIOLIB_ERR_NONE &&
+                   radio.setSpreadingFactor(p->sf) == RADIOLIB_ERR_NONE &&
+                   radio.setCodingRate(p->cr) == RADIOLIB_ERR_NONE &&
+                   radio.setBandwidth(p->bw) == RADIOLIB_ERR_NONE &&
                    radio.setPreambleLength(8) == RADIOLIB_ERR_NONE &&
                    radio.setCRC(true) == RADIOLIB_ERR_NONE &&
                    radio.setOutputPower(currentTX) == RADIOLIB_ERR_NONE;
 
     if (success) {
-        currentSF = p.sf;
-        currentCR = p.cr;
-        currentBW = p.bw;
+        currentSF = p->sf;
+        currentCR = p->cr;
+        currentBW = p->bw;
         updateRetryParameters();
     }
     return success;
 }
 
-bool LoRaCore::applyFSK(const FSKProfile &p) {
-    int result = radio.beginFSK(p.bitrate / 1000.0f, p.deviation / 1000.0f, p.rxBw / 1000.0f, 4);
+bool LoRaCore::applyFSK(const FSKProfile *p) {
+    int result = radio.beginFSK(p->bitrate / 1000.0f, p->deviation / 1000.0f, p->rxBw / 1000.0f, 4);
     if (result != RADIOLIB_ERR_NONE) {
         return false;
     }
     bool success = radio.setCRC(true) == RADIOLIB_ERR_NONE;
     if (success) {
-        currentBitrate = p.bitrate;
-        currentDeviation = p.deviation;
-        currentBW = p.rxBw;
+        currentBitrate = p->bitrate;
+        currentDeviation = p->deviation;
+        currentBW = p->rxBw;
         updateRetryParameters();
     }
     return success;
@@ -1106,7 +1123,7 @@ void LoRaCore::putToLogBuffer(const String &msg) {
 bool LoRaCore::switchTo(RadioMode m) {
     if (m == _mode)
         return true;
-    bool ok = (m == RadioMode::LORA) ? applyLoRa(_loraLong) : applyFSK(_fskFast);
+    bool ok = (m == RadioMode::LORA) ? applyLoRa(&_loraLong) : applyFSK(&_fskFast);
     if (ok) {
         _mode = m;
         LLog(String("[Warning] LoRaCore: Switched to ") + (m == RadioMode::LORA ? "[LoRa]" : "[GFSK]"));
@@ -1124,7 +1141,7 @@ PacketId_t LoRaCore::sendAsaRequest(uint8_t profileIndex, LoraAddress_t receiver
     uint8_t payload[1];
     payload[0] = pkt.profileIndex;
 
-    return sendPacketBase(receiver, pkt, payload);
+    return sendPacketBase(receiver, &pkt, payload);
 }
 
 PacketId_t LoRaCore::sendAsaResponse(uint8_t profileIndex, LoraAddress_t receiver) {
@@ -1135,7 +1152,7 @@ PacketId_t LoRaCore::sendAsaResponse(uint8_t profileIndex, LoraAddress_t receive
     uint8_t payload[1];
     payload[0] = pkt.profileIndex;
 
-    return sendPacketBase(receiver, pkt, payload);
+    return sendPacketBase(receiver, &pkt, payload);
 }
 
 // -----------------------------------------------------------------------------
@@ -1162,6 +1179,9 @@ bool LoRaCore::handleAsaRequest(const LoRaPacket *pkt) {
             asaResponseSentTime = millis();
             xSemaphoreGive(asaMutex);
             LLog("[ASA]⏳ Will switch to profile " + String(requestedProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+            if (asaTaskHandle) {
+                xTaskNotifyGive(asaTaskHandle); 
+            }
             return true;
         } else {
             LLog("[ASA]✗ Failed to acquire asaMutex");
@@ -1188,6 +1208,9 @@ bool LoRaCore::handleAsaResponse(const LoRaPacket* pkt) {
         asaResponseReceivedTime = millis();
         xSemaphoreGive(asaMutex);
         LLog("[ASA]⏳ Will switch to profile " + String(responseProfile) + " in " + String(ASA_SWITCH_DELAY) + " ms");
+        if (asaTaskHandle) {
+            xTaskNotifyGive(asaTaskHandle); 
+        }
         return true;
     } else {
         LLog("[ASA]✗ Failed to acquire asaMutex");
@@ -1252,8 +1275,36 @@ bool LoRaCore::processAsaProfileSwitch() {
 }
 
 void LoRaCore::processAsaProfileSwitchTask() {
-    while (true){
-        vTaskDelay(pdMS_TO_TICKS(200));
-        processAsaProfileSwitch();
+    for (;;) {
+        // ждём уведомление
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // после уведомления пытаемся дожать переключение
+        for (;;) {
+            // если уже ничего не ждём – выходим и снова ждём уведомления
+            if (!hasPendingAsa()) {
+                break;
+            }
+
+            // пытаемся переключиться
+            bool switched = processAsaProfileSwitch();
+            if (switched) {
+                // профиль применён, pendingAsaProfile очищен внутри → выходим
+                break;
+            }
+
+            // не время ещё (ждём ASA_SWITCH_DELAY)
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
+}
+
+bool LoRaCore::hasPendingAsa() {
+    if (!asaMutex) return false;
+    bool res = false;
+    if (xSemaphoreTake(asaMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        res = (pendingAsaProfile >= 0);
+        xSemaphoreGive(asaMutex);
+    }
+    return res;
 }
