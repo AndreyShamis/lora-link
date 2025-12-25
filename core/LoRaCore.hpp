@@ -116,6 +116,21 @@ private:
     std::map<LoraAddress_t, ClientInfo> clients;
     SemaphoreHandle_t clientsMutex = nullptr;
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AUTO ASA SYSTEM - Автоматическая адаптация профилей на основе RSSI клиентов
+    // ═══════════════════════════════════════════════════════════════════════════
+    bool autoAsaEnabled = false;                    // Включена ли авто-ASA система
+    unsigned long autoAsaCheckInterval = 10000;      // Интервал проверки (10 сек)
+    unsigned long lastAutoAsaCheck = 0;              // Время последней проверки
+    float autoAsaRssiHysteresis = 5.0f;             // Гистерезис для предотвращения частых переключений (5 dBm)
+    static TaskHandle_t autoAsaTaskHandle;           // Задача для авто-ASA
+    
+    // Последний рекомендованный профиль для каждого клиента
+    std::map<LoraAddress_t, uint8_t> lastRecommendedProfile;
+    
+    void autoAsaTask();                             // Задача мониторинга и отправки ASA
+    static void autoAsaTaskWrapper(void *param);
+
     void processAsaProfileSwitchTask();
     bool hasPendingAsa();
 public:
@@ -202,6 +217,28 @@ public:
             xSemaphoreGive(clientsMutex);
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AUTO ASA MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    // Включить/выключить автоматическую адаптацию ASA
+    void setAutoAsaEnabled(bool enabled) { autoAsaEnabled = enabled; }
+    bool isAutoAsaEnabled() const { return autoAsaEnabled; }
+    
+    // Настроить интервал проверки ASA (в миллисекундах)
+    void setAutoAsaCheckInterval(unsigned long intervalMs) { autoAsaCheckInterval = intervalMs; }
+    unsigned long getAutoAsaCheckInterval() const { return autoAsaCheckInterval; }
+    
+    // Настроить гистерезис RSSI (в dBm)
+    void setAutoAsaRssiHysteresis(float hysteresis) { autoAsaRssiHysteresis = hysteresis; }
+    float getAutoAsaRssiHysteresis() const { return autoAsaRssiHysteresis; }
+    
+    // Рекомендовать профиль на основе RSSI/SNR клиента
+    uint8_t recommendProfileForClient(LoraAddress_t clientAddr);
+    
+    // Проверить все клиенты и отправить ASA запросы при необходимости
+    void checkAndSendAutoAsa();
 
     void putToLogBuffer(const String &msg);
     bool applyProfileFromSettings(uint8_t profileIndex);

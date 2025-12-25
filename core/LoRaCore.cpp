@@ -4,6 +4,7 @@
 TaskHandle_t LoRaCore::receiverTaskHandle = nullptr;
 TaskHandle_t LoRaCore::senderTaskHandle = nullptr;
 TaskHandle_t LoRaCore::asaTaskHandle = nullptr;
+TaskHandle_t LoRaCore::autoAsaTaskHandle = nullptr;
 
 // Helper logging functions (global, not class methods)
 void LLog(const char *s)
@@ -44,6 +45,12 @@ void LoRaCore::processAsaProfileSwitchWrapper(void *param)
 {
     static_cast<LoRaCore *>(param)->processAsaProfileSwitchTask();
 }
+
+void LoRaCore::autoAsaTaskWrapper(void *param)
+{
+    static_cast<LoRaCore *>(param)->autoAsaTask();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -98,8 +105,9 @@ bool LoRaCore::begin()
     BaseType_t res3 = xTaskCreatePinnedToCore(resendTaskWrapper, "LoRaRetry", 4096, this, 1, nullptr, 0);
     BaseType_t res4 = xTaskCreatePinnedToCore(logTaskWrapper, "LoRaLog", 3072, this, 1, nullptr, 0);
     BaseType_t res5 = xTaskCreatePinnedToCore(processAsaProfileSwitchWrapper, "LoRaASA", 4096, this, 1, &asaTaskHandle, 0);
+    BaseType_t res6 = xTaskCreatePinnedToCore(autoAsaTaskWrapper, "AutoASA", 4096, this, 1, &autoAsaTaskHandle, 0);
 
-    if (res1 != pdPASS || res2 != pdPASS || res3 != pdPASS || res4 != pdPASS || res5 != pdPASS)
+    if (res1 != pdPASS || res2 != pdPASS || res3 != pdPASS || res4 != pdPASS || res5 != pdPASS || res6 != pdPASS)
     {
         LLog("LoRaCore: Failed to create tasks");
         return false;
@@ -1307,4 +1315,135 @@ bool LoRaCore::hasPendingAsa() {
         xSemaphoreGive(asaMutex);
     }
     return res;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTO ASA SYSTEM - Автоматическая адаптация профилей
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Рекомендовать профиль на основе RSSI/SNR клиента
+uint8_t LoRaCore::recommendProfileForClient(LoraAddress_t clientAddr) {
+    ClientInfo info;
+    if (!getClientInfo(clientAddr, info)) {
+        return currentProfileIndex; // Клиент не найден, используем текущий профиль
+    }
+    
+    // Если не получали пакетов от клиента - нет данных для рекомендации
+    if (!info.hasReceivedPackets) {
+        return currentProfileIndex;
+    }
+    
+    float rssi = info.getFilteredRssi();
+    float snr = info.lastSnr;
+    
+    // Проверка валидности данных
+    // SNR часто может быть невалидным (-20 или другие некорректные значения)
+    // В таком случае используем только RSSI для выбора профиля
+    bool snrValid = (snr > -15.0f && snr < 20.0f);
+    
+    // Применяем гистерезис: если текущий профиль уже рекомендован
+    auto it = lastRecommendedProfile.find(clientAddr);
+    if (it != lastRecommendedProfile.end()) {
+        uint8_t lastProfile = it->second;
+        
+        // Если RSSI изменился незначительно - оставляем старый профиль
+        if (lastProfile < LORA_PROFILE_COUNT) {
+            float lastMinRssi = rssiToProfileTable[0].minRssi; // дефолт
+            
+            // Найдем порог для текущего профиля
+            for (size_t i = 0; i < rssiProfileCount; i++) {
+                if (rssiToProfileTable[i].profileIndex == lastProfile) {
+                    lastMinRssi = rssiToProfileTable[i].minRssi;
+                    break;
+                }
+            }
+            
+            // Проверяем гистерезис
+            if (fabs(rssi - lastMinRssi) < autoAsaRssiHysteresis) {
+                return lastProfile; // Не меняем профиль из-за гистерезиса
+            }
+        }
+    }
+    
+    // Ищем подходящий профиль в таблице (от лучшего к худшему)
+    // Используем RSSI как основной критерий, SNR - только если валиден
+    for (size_t i = 0; i < rssiProfileCount; i++) {
+        bool rssiOk = (rssi >= rssiToProfileTable[i].minRssi);
+        bool snrOk = !snrValid || (snr >= rssiToProfileTable[i].minSnr);
+        
+        if (rssiOk && snrOk) {
+            uint8_t recommendedProfile = rssiToProfileTable[i].profileIndex;
+            // НЕ сохраняем здесь - сохраним только когда реально отправим ASA
+            return recommendedProfile;
+        }
+    }
+    
+    // Если не нашли в таблице - используем самый надёжный профиль (0)
+    return 0;
+}
+
+// Проверить все клиенты и отправить ASA запросы при необходимости
+void LoRaCore::checkAndSendAutoAsa() {
+    if (!autoAsaEnabled) {
+        return;
+    }
+    
+    // Проверяем интервал
+    unsigned long now = millis();
+    if (now - lastAutoAsaCheck < autoAsaCheckInterval) {
+        return;
+    }
+    lastAutoAsaCheck = now;
+    
+    // Получаем список активных клиентов
+    auto clientList = getAllClients();
+    
+    for (const auto& client : clientList) {
+        // Пропускаем клиентов, от которых не получали пакеты
+        if (!client.hasReceivedPackets) {
+            continue;
+        }
+        
+        // Пропускаем неактивных клиентов (не видели > 30 сек)
+        if (!client.isActive(30000)) {
+            continue;
+        }
+        
+        // Получаем рекомендованный профиль на основе RSSI/SNR клиента
+        uint8_t recommendedProfile = recommendProfileForClient(client.address);
+        
+        // Проверяем, был ли уже рекомендован этот профиль для данного клиента
+        auto it = lastRecommendedProfile.find(client.address);
+        uint8_t lastProfile = (it != lastRecommendedProfile.end()) ? it->second : 255; // 255 = не было рекомендаций
+        
+        // Если рекомендуемый профиль отличается от последнего рекомендованного - отправляем ASA
+        if (recommendedProfile != lastProfile) {
+            char logMsg[120];
+            const char* snrStatus = (client.lastSnr > -15.0f && client.lastSnr < 20.0f) ? "" : " [SNR?]";
+            snprintf(logMsg, sizeof(logMsg), 
+                    "[AutoASA] Client %u: RSSI=%.1f SNR=%.1f%s → Profile %u (was %u)",
+                    client.address, client.getFilteredRssi(), client.lastSnr, snrStatus,
+                    recommendedProfile, (lastProfile == 255 ? 0 : lastProfile));
+            putToLogBuffer(String(logMsg));
+            
+            // Отправляем ASA запрос клиенту с рекомендуемым профилем
+            sendAsaRequest(recommendedProfile, client.address);
+            
+            // Обновляем последний рекомендованный профиль
+            lastRecommendedProfile[client.address] = recommendedProfile;
+        }
+    }
+}
+
+// Задача мониторинга клиентов и автоматической отправки ASA
+void LoRaCore::autoAsaTask() {
+    LLog("LoRaCore: Auto-ASA task started");
+    
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Проверяем каждую секунду
+        
+        if (autoAsaEnabled) {
+            checkAndSendAutoAsa();
+        }
+    }
 }

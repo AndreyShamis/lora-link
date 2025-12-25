@@ -236,9 +236,9 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         autoHeartbeat = false;
         log("✓ Auto heartbeat disabled");
         
-    } else if (cmd_lower.startsWith("heartbeat ")) {
+    } else if (cmd_lower.startsWith("heartbeat ")|| cmd_lower.startsWith("hb ")) {
         String arg = cmd.substring(10);
-        if (arg.startsWith("interval ")) {
+        if (arg.startsWith("interval ") || arg.startsWith("i ")) {
             unsigned long interval = arg.substring(9).toInt();
             if (interval >= 100 && interval <= 60000) {
                 heartbeatInterval = interval;
@@ -247,8 +247,8 @@ void processCommand(const String& cmd, const String& cmd_lower) {
                 log("✗ Invalid interval. Use 100-60000 ms");
             }
         } else {
-            log("Usage: heartbeat on|off|interval <ms>");
-            log("Usage: heartbeat interval 1000");
+            log("Usage: \r\nheartbeat on|off|interval <ms>");
+            log("Usage: \r\nheartbeat interval 1000");
         }
         
     } else if (cmd_lower == "info") {
@@ -334,6 +334,39 @@ void processCommand(const String& cmd, const String& cmd_lower) {
             logf("✗ Invalid profile. Use 0-%d", LORA_PROFILE_COUNT-1);
         }
         
+    } else if (cmd_lower == "autoasa on") {
+        lora->setAutoAsaEnabled(true);
+        log("✓ Auto-ASA enabled");
+        
+    } else if (cmd_lower == "autoasa off") {
+        lora->setAutoAsaEnabled(false);
+        log("✓ Auto-ASA disabled");
+        
+    } else if (cmd_lower.startsWith("autoasa interval ")) {
+        int interval = cmd.substring(17).toInt();
+        if (interval >= 1000 && interval <= 300000) {
+            lora->setAutoAsaCheckInterval(interval);
+            logf("✓ Auto-ASA interval set to %d ms", interval);
+        } else {
+            log("✗ Invalid interval. Use 1000-300000 ms");
+        }
+        
+    } else if (cmd_lower.startsWith("autoasa hysteresis ")) {
+        float hysteresis = cmd.substring(19).toFloat();
+        if (hysteresis >= 0.5f && hysteresis <= 10.0f) {
+            lora->setAutoAsaRssiHysteresis(hysteresis);
+            logf("✓ Auto-ASA hysteresis set to %.1f dBm", hysteresis);
+        } else {
+            log("✗ Invalid hysteresis. Use 0.5-10.0 dBm");
+        }
+        
+    } else if (cmd_lower == "autoasa status") {
+        log("\n=== Auto-ASA Status ===");
+        logf("Enabled: %s", lora->isAutoAsaEnabled() ? "Yes" : "No");
+        logf("Check interval: %lu ms", lora->getAutoAsaCheckInterval());
+        logf("RSSI hysteresis: %.1f dBm", lora->getAutoAsaRssiHysteresis());
+        log("=======================\n");
+        
     } else if (cmd_lower.startsWith("setid ")) {
         int newId = cmd.substring(6).toInt();
         if (newId >= 0 && newId <= 255) {
@@ -368,6 +401,13 @@ void processCommand(const String& cmd, const String& cmd_lower) {
         Serial.println("║  !lora              Force LoRa mode         ║");
         Serial.println("║  !fsk               Force FSK mode          ║");
         Serial.println("║  !auto              Auto mode selection     ║");
+        Serial.println("║                                            ║");
+        Serial.println("║ AUTO-ASA (Adaptive Profile Selection)     ║");
+        Serial.println("║  autoasa on        Enable auto-ASA         ║");
+        Serial.println("║  autoasa off       Disable auto-ASA        ║");
+        Serial.println("║  autoasa status    Show auto-ASA info      ║");
+        Serial.println("║  autoasa interval <ms>  Set check interval ║");
+        Serial.println("║  autoasa hysteresis <dBm> Set hysteresis   ║");
         Serial.println("║                                            ║");
         Serial.println("║ MONITORING                                 ║");
         Serial.println("║  stats             Show statistics         ║");
