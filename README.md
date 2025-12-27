@@ -54,6 +54,7 @@ lora-link/
 ## 🌟 Features
 
 - **13 Adaptive Profiles**: 9 LoRa (SF7-12) + 4 GFSK (19.2-100 kbps)
+- **Broadcast Support**: Send packets to all nodes (0xFF address)
 - **Bulk ACK System**: Up to 10 ACKs in one packet (90% reduction)
 - **Adaptive Retry Logic**: Dynamic timeouts and retry counts
 - **RSSI/SNR Based Switching**: Automatic profile optimization

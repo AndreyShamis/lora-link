@@ -147,6 +147,10 @@ public:
     
     // Обновить информацию о клиенте при получении пакета от него
     void updateClientOnReceive(LoraAddress_t address, float rssi, float snr) {
+        // Ignore broadcast address and our own address
+        if (address == DEVICE_ID_BROADCAST || address == srcAddress) {
+            return;
+        }
         if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             auto it = clients.find(address);
             if (it == clients.end()) {
@@ -161,6 +165,10 @@ public:
     
     // Обновить информацию о клиенте при отправке пакета ему
     void updateClientOnSend(LoraAddress_t address) {
+        // Ignore broadcast address and our own address
+        if (address == DEVICE_ID_BROADCAST || address == srcAddress) {
+            return;
+        }
         if (clientsMutex && xSemaphoreTake(clientsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             auto it = clients.find(address);
             if (it == clients.end()) {
@@ -481,6 +489,14 @@ public:
         base->ackRequired = waitForAck;
         return sendPacketBase(dstAddress, base, payload);
     }
+    
+    // Send broadcast packet to all nodes
+    PacketId_t sendBroadcast(PacketBase *base, const uint8_t *payload) {
+        base->broadcast = true;      // Mark as broadcast
+        base->ackRequired = false;   // Broadcast never requires ACK
+        base->noRetry = true;        // Broadcast is fire-and-forget
+        return sendPacketBase(DEVICE_ID_BROADCAST, base, payload);
+    }
 
 private:
     // Task wrappers - implemented in .cpp
@@ -528,7 +544,7 @@ private:
         b.encrypted         = pkt->isEncrypted();
         b.compressed        = pkt->isCompressed();
         b.aggregated        = pkt->isAggregatedFrame();
-        b.internalLocalOnly = pkt->isInternalLocalOnly();
+        b.broadcast         = pkt->isBroadcastFlag();
         
         return b;
     }

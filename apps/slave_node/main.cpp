@@ -458,15 +458,15 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, &hb, (uint8_t*)&hb.count); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendBroadcast(&hb, (uint8_t*)&hb.count); // Broadcast heartbeat!
             lastHeartbeatTime = millis();
             
 #ifdef ROLE_SLAVE
-            Serial.printf("[HB] Heartbeat sent #%lu (TX: %lu, RX: %lu)\r\n", hb.count, packetsSent, packetsReceived);
+            Serial.printf("[♥️ HB-BC] Heartbeat broadcast #%lu (TX: %lu, RX: %lu)\r\n", hb.count, packetsSent, packetsReceived);
 #endif
         } else {
 #ifdef ROLE_SLAVE
-            Serial.printf("[HB] Skipping heartbeat - previous one still pending (ID: %u)\r\n", lastHeartbeatPacketId);
+            Serial.printf("[♥️ HB] Skipping heartbeat - previous one still pending (ID: %u)\r\n", lastHeartbeatPacketId);
 #endif
         }
     }

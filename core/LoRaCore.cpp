@@ -181,21 +181,34 @@ PacketId_t LoRaCore::sendPacketBase(LoraAddress_t receiverId, PacketBase *base, 
 {
     if (!outgoingQueue) {
         char s2[100];
-        snprintf(s2, sizeof(s2), "⚠️ outgoingQueue is null! Cannot send packet id=%u, type=%c", base->packetId, base->packetType);
+        snprintf(s2, sizeof(s2), "⚠️ outgoingQueue is null! Cannot send packet type=%c", base->packetType);
         putToLogBuffer(String(s2));
         return 0;
     }
     
     base->packetId = ++nextPacketId;
     
+    // === BROADCAST HANDLING ===
+    // Broadcast packets NEVER require ACK or retry
+    // Check both receiverId and base->broadcast flag
+    bool isBroadcast = (receiverId == DEVICE_ID_BROADCAST) || base->broadcast;
+    if (isBroadcast) {
+        base->broadcast = true;      // Ensure flag is set
+        base->ackRequired = false;   // No ACK for broadcast
+        base->noRetry = true;        // Fire-and-forget
+        receiverId = DEVICE_ID_BROADCAST;  // Force broadcast address
+    }
+    
     // === AUTOMATIC AGGREGATION LOGIC ===
     // Try to aggregate if:
     // 1. Not high priority
     // 2. Not ACK/BULK_ACK (they need immediate delivery)
-    // 3. Queue has packets waiting
-    // 4. Payload is small enough (leaving room for headers)
+    // 3. Not broadcast (broadcast should be sent immediately)
+    // 4. Queue has packets waiting
+    // 5. Payload is small enough (leaving room for headers)
     bool canAggregate = base->highPriority == false && 
                         base->ackRequired == false &&
+                        !isBroadcast &&
                         base->payloadLen <= 30 &&
                         uxQueueMessagesWaiting(outgoingQueue) > 0;
     
@@ -418,7 +431,7 @@ void LoRaCore::packBaseIntoLoRa(LoRaPacket *out,
     out->setEncrypted(base->encrypted);
     out->setCompressed(base->compressed);
     out->setAggregatedFrame(base->aggregated);
-    out->setInternalLocalOnly(base->internalLocalOnly);
+    out->setBroadcastFlag(base->broadcast);
 
     // --- PAYLOAD CHECKS ---
     if (base->payloadLen > MAX_LORA_PAYLOAD) {
@@ -787,6 +800,18 @@ void LoRaCore::receiveTask()
                     _rx_errors++;
                     continue;
                 }
+                
+                // === BROADCAST PACKET HANDLING ===
+                // Accept broadcast packets (receiverId == 0xFF) regardless of our address
+                // Also accept packets addressed directly to us
+                bool isBroadcast = pkt.isBroadcast();
+                bool isForUs = (pkt.getReceiverId() == srcAddress);
+                
+                if (!isBroadcast && !isForUs) {
+                    // Packet is not for us and not broadcast - ignore it
+                    receivingInProgress = false;
+                    continue;
+                }
 
                 // Обновляем информацию о клиенте
                 updateClientOnReceive(pkt.getSenderId(), rssi, snr);
@@ -802,9 +827,15 @@ void LoRaCore::receiveTask()
                 if (pkt.payloadLen > MAX_LORA_PAYLOAD) { payloadHex = "❌CORRUPTED_LEN=" + String(pkt.payloadLen); }
                 else if (pkt.payloadLen > 30) { payloadHex += "...";}
 
-                snprintf(s, sizeof(s), "[P:%d][RX on %d][L:%d]%lums→[%u->%u], T=[%d], id:%u,  state:%d, %u", pending.size(), getCurrentProfileIndex(), len, t1 - t0, pkt.getSenderId(), pkt.getReceiverId(), pkt.packetType, pkt.packetId,crcState, pkt.payloadLen);
+                snprintf(s, sizeof(s), "[P:%d][RX on %d][L:%d]%lums→[%u->%u%s], T=[%d], id:%u,  state:%d, %u", 
+                        pending.size(), getCurrentProfileIndex(), len, t1 - t0, 
+                        pkt.getSenderId(), pkt.getReceiverId(), 
+                        isBroadcast ? "📡BC" : "", 
+                        pkt.packetType, pkt.packetId, crcState, pkt.payloadLen);
                 fullLog = String(s) + ":[" + payloadHex + "]";
                 putToLogBuffer(fullLog);
+                
+                // Broadcast packets NEVER require ACK - skip ACK logic
                 if (pkt.packetType == CMD_ACK && !pkt.isAckRequired()) { handleAck(&pkt); } 
                 else if(pkt.packetType == CMD_BULK_ACK && !pkt.isAckRequired()) { handleBulkAck(&pkt); }
                         // Handle ASA response - DON'T apply yet, wait for ACK to be sent first
@@ -812,7 +843,8 @@ void LoRaCore::receiveTask()
                 // Handle ASA request - respond with ASA response (DON'T switch yet!)
                 else if (pkt.packetType == CMD_REQUEST_ASA) { handleAsaRequest(&pkt); }
                 else {
-                    if (pkt.isAckRequired()) {
+                    // Broadcast packets don't require ACK
+                    if (pkt.isAckRequired() && !isBroadcast) {
                         addAckToBulk(pkt.packetId, pkt.getSenderId());
                         if(pkt.isHighPriority()){ flushBulkAck(pkt.getSenderId()); }
                     }

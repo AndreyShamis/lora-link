@@ -13,7 +13,7 @@ public:
     uint8_t packetType;     // 'C','T','I','S','A','G','H'=Heartbeat
     PacketId_t packetId;    // sequential number 0…255 (unified type)
     uint8_t payloadLen = 0; // body length (without header and CRC)
-    // NEW LOGICAL FLAGS
+    // NEW LOGICAL FLAGS (8 bits total)
     bool ackRequired = false;      // нужно ACK? 
     bool highPriority = false;    // пакет важный?
     bool service = false;         // служебный/системный?
@@ -21,7 +21,7 @@ public:
     bool encrypted = false;       // шифрован?
     bool compressed = false;      // payload сжат?
     bool aggregated = false;      // AGR packet?
-    bool internalLocalOnly = false; // внутренняя логика?
+    bool broadcast = false;       // broadcast пакет (0xFF адрес получателя)?
 };
 
 // Free function for converting PacketBase to string (safer than member function)

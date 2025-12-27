@@ -516,11 +516,11 @@ void loop() {
         if (!previousHeartbeatPending) {
             PacketHeartbeat hb;
             hb.count = heartbeatCounter++; // Increment counter for each heartbeat
-            lastHeartbeatPacketId = lora->sendPacketBase(TARGET_DEVICE_ID, &hb, (uint8_t*)&hb.count); // No ACK for heartbeat
+            lastHeartbeatPacketId = lora->sendBroadcast(&hb, (uint8_t*)&hb.count); // Broadcast heartbeat!
             lastHeartbeatTime = millis();
-            logf("[HB] Heartbeat sent #%lu", hb.count);
+            logf("[♥️ HB-BC] Heartbeat broadcast #%lu", hb.count);
         } else {
-            logf("[HB] Skipping heartbeat - previous one still pending (ID: %u)", lastHeartbeatPacketId);
+            logf("[♥️ HB] Skipping heartbeat - previous one still pending (ID: %u)", lastHeartbeatPacketId);
         }
     }
     

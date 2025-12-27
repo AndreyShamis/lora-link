@@ -9,18 +9,21 @@
 // ═══════════════════════════════════════════════════════════════════════════
 #pragma pack(push, 1)
 
-// Heartbeat packet
+// Heartbeat packet - BROADCAST MESSAGE
+// Отправляется всем узлам в сети для объявления присутствия
 class PacketHeartbeat : public PacketBase
 {
 public:
     uint32_t count; // arbitrary counter
     
     PacketHeartbeat() : count(0) {
-        packetType      = CMD_HEARTBEAT; // or another suitable type for heartbeat
+        packetType      = CMD_HEARTBEAT;
         payloadLen      = sizeof(count);
-        ackRequired     = false;     // ACK не должен требовать ACK
-        highPriority    = false;     // ACK должен лететь немедленно
-        service         = false;          // служебный пакет
+        ackRequired     = false;        // Broadcast не требует ACK
+        highPriority    = false;        // Обычный приоритет
+        service         = true;         // Служебный пакет
+        noRetry         = true;         // Не ретраить broadcast
+        broadcast       = true;         // Это broadcast пакет!
     }
 };
 

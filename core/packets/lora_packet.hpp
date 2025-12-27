@@ -15,7 +15,7 @@ enum LoRaPacketFlags : uint8_t {
     LORA_PKT_FLAG_ENCRYPTED     = 0x10, // 5-й бит (шифрованный payload)
     LORA_PKT_FLAG_COMPRESSED    = 0x20, // 6-й бит (payload сжат)
     LORA_PKT_FLAG_AGGREGATED    = 0x40, // 7-й бит (это AGR кадр/агрегированная посылка)
-    LORA_PKT_FLAG_INTERNAL      = 0x80  // 8-й бит (внутренний/локальный/для логики)
+    LORA_PKT_FLAG_BROADCAST     = 0x80  // 8-й бит (broadcast пакет, 0xFF адрес)
 };
 
 
@@ -35,6 +35,11 @@ struct LoRaPacket
     LoraAddress_t getSenderId() const { return senderId; }
     LoraAddress_t getReceiverId() const { return receiverId; }
     uint8_t getPacketType() const { return packetType; }
+    
+    // Broadcast check - проверяем И адрес И флаг для надёжности
+    bool isBroadcast() const { 
+        return (receiverId == DEVICE_ID_BROADCAST) || (flags & LORA_PKT_FLAG_BROADCAST); 
+    }
 
     // Setter functions
     void setSenderId(LoraAddress_t id) { senderId = id; }
@@ -47,7 +52,7 @@ struct LoRaPacket
     bool isEncrypted()          const { return flags & LORA_PKT_FLAG_ENCRYPTED; }
     bool isCompressed()         const { return flags & LORA_PKT_FLAG_COMPRESSED; }
     bool isAggregatedFrame()    const { return flags & LORA_PKT_FLAG_AGGREGATED; }
-    bool isInternalLocalOnly()  const { return flags & LORA_PKT_FLAG_INTERNAL; }
+    bool isBroadcastFlag()      const { return flags & LORA_PKT_FLAG_BROADCAST; }
 
     void setAckRequired(bool v)       { v ? flags |=  LORA_PKT_FLAG_ACK_REQUIRED  : flags &= ~LORA_PKT_FLAG_ACK_REQUIRED; }
     void setHighPriority(bool v)      { v ? flags |=  LORA_PKT_FLAG_HIGH_PRIORITY : flags &= ~LORA_PKT_FLAG_HIGH_PRIORITY; }
@@ -56,7 +61,7 @@ struct LoRaPacket
     void setEncrypted(bool v)         { v ? flags |=  LORA_PKT_FLAG_ENCRYPTED     : flags &= ~LORA_PKT_FLAG_ENCRYPTED; }
     void setCompressed(bool v)        { v ? flags |=  LORA_PKT_FLAG_COMPRESSED    : flags &= ~LORA_PKT_FLAG_COMPRESSED; }
     void setAggregatedFrame(bool v)   { v ? flags |=  LORA_PKT_FLAG_AGGREGATED    : flags &= ~LORA_PKT_FLAG_AGGREGATED; }
-    void setInternalLocalOnly(bool v) { v ? flags |=  LORA_PKT_FLAG_INTERNAL      : flags &= ~LORA_PKT_FLAG_INTERNAL; }
+    void setBroadcastFlag(bool v)     { v ? flags |=  LORA_PKT_FLAG_BROADCAST     : flags &= ~LORA_PKT_FLAG_BROADCAST; }
 
 };
 static_assert(sizeof(LoRaPacket) <= 150, "LoRaPacket too large!");
